@@ -1,0 +1,60 @@
+# YASEN-ALPHA Production Configuration
+project:
+  name: "YASEN-ALPHA"
+  version: "2.0.0"
+  environment: "production"  # development, staging, production
+
+paths:
+  raw_data: "data/raw/"
+  processed_data: "data/processed/"
+  models: "data/models/"
+  logs: "logs/"
+  backtests: "data/backtests/"
+
+data:
+  sources:
+    primary: "kraken"
+    backup: "bitstamp"
+    symbols: ["BTC/USD"]
+  timeframes: ["1h"]
+  start_date: "2017-01-01"
+
+features:
+  technical_indicators: true
+  sentiment: true
+  macro: false
+  lag_periods: [1, 2, 3, 6, 12, 24]
+  rolling_windows: [6, 12, 24, 48, 168]
+
+model:
+  champion: "yasen_alpha_champion.joblib"
+  win_rate: 0.5919
+  base_threshold: 0.41
+  dynamic_threshold:
+    enabled: true
+    low_vol: 1.0
+    med_vol: 1.2
+    high_vol: 1.2
+  
+training:
+  n_estimators: 500
+  max_depth: 7
+  learning_rate: 0.03
+  cv_folds: 5
+  test_size: 0.2
+
+risk:
+  max_risk_per_trade: 0.02
+  max_daily_risk: 0.06
+  stop_loss_atr: 2
+  take_profit_ratio: 2
+
+execution:
+  paper_trading: true
+  exchange: "paper"
+  max_slippage: 0.001
+
+monitoring:
+  metrics: ["win_rate", "sharpe_ratio", "max_drawdown"]
+  alert_on_drawdown: 0.15
+  retrain_threshold: 0.55

@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""
+YASEN-ALPHA Professional Pipeline Orchestrator
+Run: python scripts/run_pipeline.py --stage all
+"""
+
+import argparse
+import logging
+import sys
+from pathlib import Path
+from datetime import datetime
+import yaml
+import json
+
+# Add project root to Python path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'logs/pipeline_{datetime.now().strftime("%Y%m%d")}.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class DataPipeline:
+    """Data ingestion and validation pipeline"""
+    def run(self, start_date=None, end_date=None, **kwargs):
+        logger.info("🔄 Running Data Pipeline...")
+        try:
+            from src.data.sources.multi_source import MultiSourceCollector
+            
+            collector = MultiSourceCollector()
+            if start_date:
+                df = collector.fetch_ohlcv_range(start_date=start_date, end_date=end_date)
+            else:
+                df = collector.fetch_all()
+            
+            logger.info(f"✅ Data Pipeline complete: {len(df) if df is not None else 0} rows")
+            return {"status": "success", "rows": len(df) if df is not None else 0}
+        except Exception as e:
+            logger.error(f"❌ Data Pipeline failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+class FeaturePipeline:
+    """Feature engineering pipeline"""
+    def run(self, **kwargs):
+        logger.info("🔄 Running Feature Pipeline...")
+        try:
+            import pandas as pd
+            from src.features.builders.feature_builder import FeatureBuilder
+            
+            # Find latest raw data
+            raw_files = list(Path('data/raw').glob('*.parquet'))
+            if not raw_files:
+                raise Exception("No raw data found")
+            
+            latest_raw = max(raw_files, key=lambda x: x.stat().st_mtime)
+            logger.info(f"Loading raw data from {latest_raw}")
+            
+            df = pd.read_parquet(latest_raw)
+            builder = FeatureBuilder(df)
+            df_features = builder.build_features()
+            
+            # Save features
+            output_path = 'data/processed/features_latest.parquet'
+            df_features.to_parquet(output_path)
+            logger.info(f"✅ Features saved to {output_path}")
+            
+            return {"status": "success", "shape": df_features.shape}
+        except Exception as e:
+            logger.error(f"❌ Feature Pipeline failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+class TrainingPipeline:
+    """Model training pipeline"""
+    def run(self, retrain=False, **kwargs):
+        logger.info("🔄 Running Training Pipeline...")
+        try:
+            from src.training.trainer import ModelTrainer
+            
+            trainer = ModelTrainer()
+            results = trainer.train(retrain=retrain)
+            
+            logger.info(f"✅ Training Pipeline complete")
+            return results
+        except Exception as e:
+            logger.error(f"❌ Training Pipeline failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+class BacktestPipeline:
+    """Backtesting pipeline"""
+    def run(self, model_version='champion', **kwargs):
+        logger.info("🔄 Running Backtest Pipeline...")
+        try:
+            from src.backtesting.backtest import Backtester
+            
+            backtester = Backtester()
+            results = backtester.run(model_version=model_version)
+            
+            logger.info(f"✅ Backtest Pipeline complete")
+            return results
+        except Exception as e:
+            logger.error(f"❌ Backtest Pipeline failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+class PredictionPipeline:
+    """Real-time prediction pipeline"""
+    def run(self, **kwargs):
+        logger.info("🔄 Running Prediction Pipeline...")
+        try:
+            from src.models.inference.predictor import YasenAlphaPredictor
+            
+            predictor = YasenAlphaPredictor()
+            signal = predictor.get_current_signal()
+            
+            logger.info(f"✅ Prediction Pipeline complete: {signal}")
+            return {"signal": signal}
+        except Exception as e:
+            logger.error(f"❌ Prediction Pipeline failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+def main():
+    parser = argparse.ArgumentParser(description='YASEN-ALPHA Pipeline Orchestrator')
+    parser.add_argument('--stage', choices=['data', 'features', 'train', 'backtest', 'predict', 'all'],
+                       default='all', help='Pipeline stage to run')
+    parser.add_argument('--start-date', help='Start date for data fetch')
+    parser.add_argument('--end-date', help='End date for data fetch')
+    parser.add_argument('--retrain', action='store_true', help='Force retraining')
+    parser.add_argument('--model-version', default='champion', help='Model version to use')
+    
+    args = parser.parse_args()
+    
+    pipelines = {
+        'data': DataPipeline(),
+        'features': FeaturePipeline(),
+        'train': TrainingPipeline(),
+        'backtest': BacktestPipeline(),
+        'predict': PredictionPipeline()
+    }
+    
+    if args.stage == 'all':
+        logger.info("🚀 Running FULL pipeline")
+        results = {}
+        for name, pipeline in pipelines.items():
+            logger.info(f"▶️ Starting {name} pipeline")
+            results[name] = pipeline.run(
+                start_date=args.start_date,
+                end_date=args.end_date,
+                retrain=args.retrain,
+                model_version=args.model_version
+            )
+        logger.info(f"✅ Full pipeline complete")
+        print(json.dumps(results, default=str, indent=2))
+    else:
+        logger.info(f"🚀 Running {args.stage} pipeline")
+        result = pipelines[args.stage].run(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            retrain=args.retrain,
+            model_version=args.model_version
+        )
+        logger.info(f"✅ {args.stage} pipeline complete")
+        print(json.dumps(result, default=str, indent=2))
+
+if __name__ == "__main__":
+    main()
