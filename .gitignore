@@ -45,3 +45,16 @@ logs/*.log
 *.crt
 full_tree.txt
 project_structure.txt
+
+# Environment variables
+.env
+*.env
+
+# Telegram bot secrets
+telegram_bot/.env
+telegram_bot/config.py
+
+# API keys
+config/keys.json
+*.key
+*.pem
