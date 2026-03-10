@@ -23,6 +23,7 @@ data/raw/*.parquet
 data/raw/*.csv
 data/processed/*.parquet
 data/models/*.joblib
+!data/models/yasen_alpha_champion.joblib
 !data/models/.gitkeep
 data/backtests/*.csv
 logs/*.log
