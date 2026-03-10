@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest
 COPY . .
-RUN ls -la /app
+RUN ls -la /app && echo "✅ Current directory contents:" && pwd
 
 # Run the bot
-CMD ["python", "bot.py"]
+CMD python /app/bot.py
