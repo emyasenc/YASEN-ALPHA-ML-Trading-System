@@ -13,6 +13,25 @@ from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from flask import Flask, jsonify
+import threading
+import time
+
+# Simple health server
+health_app = Flask(__name__)
+
+@health_app.route('/health')
+def health():
+    return jsonify({"status": "alive", "bot": "running", "time": time.time()})
+
+def run_health_server():
+    port = int(os.environ.get('PORT', 10000))
+    health_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+# Start health server in background thread
+health_thread = threading.Thread(target=run_health_server, daemon=True)
+health_thread.start()
+print(f"✅ Health server started on port {os.environ.get('PORT', 10000)}")
 
 # Load environment variables
 load_dotenv()
