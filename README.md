@@ -396,9 +396,7 @@ Emma - CS Graduate, Machine Learning Engineer
 
 GitHub: @emyasenc
 
-LinkedIn: Emma Yasenc
-
-Email: emma.yasenc@example.com
+LinkedIn: Emma Yasenchak
 
 🙏 Acknowledgments
 XGBoost for the amazing ML library
