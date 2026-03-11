@@ -2,7 +2,7 @@
 YASEN-ALPHA Production API
 Enterprise-grade FastAPI backend for Bitcoin trading signals
 """
-from .cache import cache
+
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -124,51 +124,8 @@ async def startup_event():
     
     # Pre-load predictor
     try:
-        predictor = get_predictor()
+        get_predictor()
         logger.info("✅ Predictor loaded successfully")
-        
-        # Define background update function
-        def update_all_caches():
-            """Update all cache keys in background"""
-            try:
-                # Get fresh signal
-                predictor = get_predictor()
-                signal_data = predictor.get_current_signal()
-                signal_response = SignalResponse(
-                    signal=signal_data['signal'],
-                    confidence=round(signal_data['confidence'], 4),
-                    threshold_used=signal_data['threshold_used'],
-                    volatility=round(signal_data['volatility'], 4),
-                    timestamp=datetime.now().isoformat()
-                ).dict()
-                
-                # Get fresh price
-                df = pd.read_parquet('data/processed/features_latest.parquet')
-                df = df.tail(24)
-                current_price = df['close'].iloc[-1]
-                prev_price = df['close'].iloc[0]
-                
-                price_response = PriceResponse(
-                    price=round(float(current_price), 2),
-                    change_24h=round(((current_price - prev_price) / prev_price) * 100, 2),
-                    high_24h=round(float(df['high'].max()), 2),
-                    low_24h=round(float(df['low'].min()), 2),
-                    volume_24h=round(float(df['volume'].sum()), 2),
-                    timestamp=datetime.now().isoformat()
-                ).dict()
-                
-                return {
-                    'signal': signal_response,
-                    'price': price_response
-                }
-            except Exception as e:
-                logger.error(f"Background update failed: {e}")
-                return None
-        
-        # Start background updates
-        cache.start_background_updates(update_all_caches)
-        logger.info("✅ Background cache updater started")
-        
     except Exception as e:
         logger.error(f"❌ Failed to load predictor: {e}")
 
@@ -213,7 +170,7 @@ async def get_signal(
     auth: dict = Depends(verify_api_key)
 ):
     """
-    Get current Bitcoin trading signal (CACHED - <100ms)
+    Get current Bitcoin trading signal
     
     Returns:
     - signal: BUY, SELL, or HOLD
@@ -222,38 +179,18 @@ async def get_signal(
     - volatility: market volatility
     """
     try:
-        # Try cache first (super fast!)
-        cached_signal = cache.get('signal')
-        if cached_signal:
-            logger.info(f"✅ Cache HIT - {cache.get_stats()['hit_rate']}")
-            return JSONResponse(
-                content=cached_signal,
-                headers={
-                    "X-Cache": "HIT",
-                    "X-Cache-Hit-Rate": cache.get_stats()['hit_rate']
-                }
-            )
-        
-        # Cache miss - generate new signal (slow)
-        logger.info("⚠️ Cache MISS - generating new signal")
         predictor = get_predictor()
         signal_data = predictor.get_current_signal()
         
-        # Format response
-        response = SignalResponse(
+        # Log request (for monitoring)
+        logger.info(f"Signal requested - Auth: {auth['tier']}")
+        
+        return SignalResponse(
             signal=signal_data['signal'],
             confidence=round(signal_data['confidence'], 4),
             threshold_used=signal_data['threshold_used'],
             volatility=round(signal_data['volatility'], 4),
             timestamp=datetime.now().isoformat()
-        ).dict()
-        
-        # Store in cache
-        cache.set('signal', response)
-        
-        return JSONResponse(
-            content=response,
-            headers={"X-Cache": "MISS"}
         )
     
     except Exception as e:
@@ -269,39 +206,23 @@ async def get_price(
     auth: dict = Depends(verify_api_key)
 ):
     """
-    Get current Bitcoin price with 24h statistics (CACHED)
+    Get current Bitcoin price with 24h statistics
     """
     try:
-        # Try cache first
-        cached_price = cache.get('price')
-        if cached_price:
-            return JSONResponse(
-                content=cached_price,
-                headers={"X-Cache": "HIT"}
-            )
-        
-        # Cache miss - generate new price
+        # Load latest price data
         df = pd.read_parquet('data/processed/features_latest.parquet')
         df = df.tail(24)  # Last 24 hours
         
         current_price = df['close'].iloc[-1]
         prev_price = df['close'].iloc[0]
         
-        response = PriceResponse(
+        return PriceResponse(
             price=round(float(current_price), 2),
             change_24h=round(((current_price - prev_price) / prev_price) * 100, 2),
             high_24h=round(float(df['high'].max()), 2),
             low_24h=round(float(df['low'].min()), 2),
             volume_24h=round(float(df['volume'].sum()), 2),
             timestamp=datetime.now().isoformat()
-        ).dict()
-        
-        # Store in cache
-        cache.set('price', response)
-        
-        return JSONResponse(
-            content=response,
-            headers={"X-Cache": "MISS"}
         )
     
     except Exception as e:
@@ -440,35 +361,6 @@ async def rate_limit_info(api_key: Optional[str] = Header(None, alias="X-API-Key
     if api_key and api_key in API_KEYS:
         return API_KEYS[api_key]
     return {"tier": "public", "rate_limit": 10}
-
-# Error handlers
-@app.exception_handler(404)
-async def not_found_handler(request, exc):
-    return JSONResponse(
-        status_code=404,
-        content=ErrorResponse(
-            error="Endpoint not found",
-            code=404,
-            timestamp=datetime.now().isoformat()
-        ).dict()
-    )
-
-@app.exception_handler(500)
-async def internal_error_handler(request, exc):
-    logger.error(f"Internal server error: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content=ErrorResponse(
-            error="Internal server error",
-            code=500,
-            timestamp=datetime.now().isoformat()
-        ).dict()
-    )
-
-@app.get("/cache-stats", tags=["Monitoring"])
-async def get_cache_stats():
-    """Get cache performance statistics"""
-    return cache.get_stats()
 
 # Error handlers
 @app.exception_handler(404)
