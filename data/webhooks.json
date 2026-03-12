@@ -1,0 +1,16 @@
+{
+  "pro_key_2026": [
+    {
+      "id": "wh_1773358843_0",
+      "url": "https://webhook.site/9c1037c6-0efb-402b-b048-d14a83c8bb51",
+      "events": [
+        "signal_change",
+        "price_alert"
+      ],
+      "secret": "test123",
+      "created_at": "2026-03-12T19:40:43.600405",
+      "last_triggered": null,
+      "active": true
+    }
+  ]
+}
