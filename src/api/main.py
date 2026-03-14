@@ -22,6 +22,7 @@ import asyncio
 import threading
 import json
 import requests
+import random
 
 # Configure logging
 logging.basicConfig(
@@ -1395,6 +1396,39 @@ async def test_webhook(
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Webhook failed: {str(e)}")
+
+# KEEP ALIVE SYSTEM - Prevents Render from sleeping
+# KEEP ALIVE SYSTEM - Prevents Render from sleeping
+def keep_alive():
+    """Self-ping every 4-6 minutes to keep Render awake"""
+    render_url = os.environ.get('RENDER_URL', 'https://yasen-alpha-ml-trading-system.onrender.com')
+    
+    while True:
+        # Random interval between 4-6 minutes (more natural)
+        sleep_time = 240 + (60 * random.random())  # 4-5 minutes
+        time.sleep(sleep_time)
+        
+        try:
+            # Ping health endpoint
+            response = requests.get(f"{render_url}/health", timeout=10)
+            
+            if response.status_code == 200:
+                # Randomly choose second endpoint (less predictable)
+                if random.random() > 0.5:
+                    requests.get(f"{render_url}/cache-stats", timeout=5)
+                else:
+                    requests.get(f"{render_url}/live-stats", timeout=5)
+                    
+                logger.info(f"💤 Keep-alive ping successful (sleep: {sleep_time:.0f}s)")
+            
+        except Exception as e:
+            logger.error(f"Self-ping failed: {e}")
+            pass  # Silent fail - won't crash
+        
+# Start keep-alive in background thread (works on Render AND locally)
+keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
+keep_alive_thread.start()
+logger.info("✅ Keep-alive system started - API will stay awake 24/7!")
 
 if __name__ == "__main__":
     import uvicorn
