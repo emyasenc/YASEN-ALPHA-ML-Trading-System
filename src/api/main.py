@@ -26,6 +26,21 @@ import requests
 import random
 from collections import defaultdict
 import hashlib
+import gc
+import psutil
+
+# Force garbage collection periodically
+@app.middleware("http")
+async def add_memory_management(request: Request, call_next):
+    """Monitor and manage memory usage"""
+    response = await call_next(request)
+    
+    # Force garbage collection every 100 requests
+    if random.randint(1, 100) == 1:
+        gc.collect()
+        logger.info(f"🧹 Garbage collected. Memory: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
+    
+    return response
 
 # Configure logging
 logging.basicConfig(
