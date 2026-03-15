@@ -805,31 +805,32 @@ async def get_signal_timeframe(
 ):
     """
     Get Bitcoin trading signal for specific timeframe
-    
-    Timeframes: 5min, 15min, 1h, 4h, 1d
-    
-    Rate limits by tier:
-    - Free: 1h only
-    - Pro: 15min, 1h, 4h
-    - Ultra: All timeframes
     """
     try:
-        # Check tier restrictions
+        logger.info(f"🔍 TIMEFRAME REQUEST: {timeframe} with tier {auth['tier']}")
+        
+        # Validate timeframe
         valid_timeframes = ["5min", "15min", "1h", "4h", "1d"]
         if timeframe not in valid_timeframes:
             raise HTTPException(status_code=400, detail="Invalid timeframe")
         
-        # Tier-based restrictions
+        # Tier-based access control
         if auth['tier'] == 'free' and timeframe != '1h':
-            raise HTTPException(status_code=403, detail="Free tier only has 1h signals. Upgrade for more!")
+            logger.info(f"⛔ Free tier attempted {timeframe} - blocking")
+            raise HTTPException(
+                status_code=403, 
+                detail="Free tier only has 1h signals. Upgrade for more!"
+            )
         
         if auth['tier'] == 'pro' and timeframe in ['5min', '1d']:
-            raise HTTPException(status_code=403, detail="Pro tier has 15min, 1h, 4h. Upgrade to Ultra for 5min and 1d!")
+            logger.info(f"⛔ Pro tier attempted {timeframe} - blocking")
+            raise HTTPException(
+                status_code=403, 
+                detail="Pro tier has 15min, 1h, 4h. Upgrade to Ultra for 5min and 1d!"
+            )
         
-        # Create cache key with timeframe
+        # Try cache
         cache_key = f'signal_{timeframe}'
-        
-        # Try cache first
         cached_signal = cache.get(cache_key)
         if cached_signal:
             logger.info(f"✅ Cache HIT for {timeframe}")
@@ -842,60 +843,58 @@ async def get_signal_timeframe(
                 }
             )
         
-        # Cache miss - generate new signal
         logger.info(f"⚠️ Cache MISS for {timeframe} - generating...")
         
         # Get resampled data
-        df = resample_data(timeframe)
+        try:
+            df = resample_data(timeframe)
+            logger.info(f"📊 Resampled data shape: {df.shape}")
+        except Exception as e:
+            logger.error(f"❌ Resampling failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Data resampling failed: {str(e)}")
         
         # Get predictor
         predictor = get_predictor()
         
-        # Instead of using predictor.model directly, let's use the predictor's method
-        # But we need to pass the resampled data somehow
-        
-        # For now, let's get the latest data point with ALL features
+        # Prepare features
         exclude_cols = ['open', 'high', 'low', 'close', 'volume']
         feature_cols = [col for col in df.columns if col not in exclude_cols]
+        logger.info(f"🔧 Feature columns: {len(feature_cols)}")
         
-        # Get the last row with features
+        # Get last row
         X = df[feature_cols].tail(1)
+        logger.info(f"📈 X shape: {X.shape}")
         
         if len(X) == 0:
             raise HTTPException(status_code=503, detail=f"No data available for {timeframe}")
         
-        # Try to use the model directly (bypass predictor for now)
-        if hasattr(predictor, 'model') and hasattr(predictor.model, 'predict_proba'):
-            # Direct model access
-            if isinstance(predictor.model, dict) and 'models' in predictor.model:
-                # Ensemble model
-                probs = []
-                for model in predictor.model['models']:
-                    if hasattr(model, 'predict_proba'):
-                        prob = model.predict_proba(X)[0][1]
-                        probs.append(prob)
-                prob = np.mean(probs)
+        # Get prediction
+        try:
+            if hasattr(predictor, 'model') and hasattr(predictor.model, 'predict_proba'):
+                if isinstance(predictor.model, dict) and 'models' in predictor.model:
+                    probs = []
+                    for model in predictor.model['models']:
+                        if hasattr(model, 'predict_proba'):
+                            prob = model.predict_proba(X)[0][1]
+                            probs.append(prob)
+                    prob = np.mean(probs)
+                else:
+                    prob = predictor.model.predict_proba(X)[0][1]
             else:
-                # Single model
-                prob = predictor.model.predict_proba(X)[0][1]
-        else:
-            # Fallback to predictor's method
-            # This is a hack - you might need to modify your predictor class
-            try:
-                # Try to call the predictor with the resampled data
-                signal_data = predictor.get_current_signal()  # This uses original data
-                prob = signal_data['confidence']
-            except:
                 prob = 0.5
+            logger.info(f"✅ Prediction successful: {prob:.4f}")
+        except Exception as e:
+            logger.error(f"❌ Prediction failed: {e}")
+            prob = 0.5
         
         # Calculate signal
         threshold = getattr(predictor, 'threshold', 0.45)
         signal = "BUY" if prob > threshold else "HOLD"
         
         # Calculate volatility
-        volatility = df['close'].pct_change().std() * np.sqrt(24)
+        volatility = float(df['close'].pct_change().std() * np.sqrt(24))
         if pd.isna(volatility) or volatility == 0:
-            volatility = 0.01  # Default
+            volatility = 0.01
         
         response = {
             "signal": signal,
@@ -907,9 +906,9 @@ async def get_signal_timeframe(
             "model_version": "2.0.0"
         }
         
-        # Store in cache
+        # Cache it
         cache.set(cache_key, response)
-        logger.info(f"✅ Generated {timeframe} signal: {signal} with {prob:.2%} confidence")
+        logger.info(f"✅ Generated {timeframe} signal: {signal}")
         
         return JSONResponse(
             content=response,
@@ -923,11 +922,11 @@ async def get_signal_timeframe(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting {timeframe} signal: {e}")
+        logger.error(f"❌ Unhandled error in {timeframe}: {str(e)}")
         import traceback
         traceback.print_exc()
-        raise HTTPException(status_code=503, detail=f"Signal temporarily unavailable: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+    
 @app.get("/available-timeframes", tags=["Info"])
 async def get_available_timeframes(
     request: Request,
