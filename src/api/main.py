@@ -1,14 +1,15 @@
 """
 YASEN-ALPHA Production API
 Enterprise-grade FastAPI backend for Bitcoin trading signals
+WITH PRODUCTION RATE LIMITING MATCHING RAPIDAPI TIERS
 """
 from .cache import cache
 from .webhooks import webhook_manager
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple
 import pandas as pd
 import numpy as np
 import joblib
@@ -23,6 +24,8 @@ import threading
 import json
 import requests
 import random
+from collections import defaultdict
+import hashlib
 
 # Configure logging
 logging.basicConfig(
@@ -34,6 +37,185 @@ logger = logging.getLogger(__name__)
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent.parent))
 from src.models.inference.predictor import YasenAlphaPredictor
+
+# ============================================================================
+# PRODUCTION RATE LIMITING SYSTEM - MATCHES RAPIDAPI TIERS
+# ============================================================================
+
+class RateLimiter:
+    """
+    Enterprise-grade rate limiting system
+    Matches RapidAPI pricing tiers exactly:
+    - Free/Basic: 100/month, 1 req/sec
+    - Pro ($29): 5,000/month, 10 req/sec
+    - Ultra ($79): 25,000/month, 50 req/sec
+    - MEGA ($199): 100,000/month, 200 req/sec
+    """
+    
+    def __init__(self):
+        # Store: {identifier: {month: request_count}}
+        self.usage = defaultdict(lambda: defaultdict(int))
+        self.per_second_usage = defaultdict(lambda: defaultdict(list))
+        self.lock = threading.Lock()
+        
+        # Rate limits per tier (requests per MONTH - matching RapidAPI)
+        self.tier_limits = {
+            "public": 100,      # Basic tier - 100/month
+            "free": 100,        # Free RapidAPI tier
+            "pro": 5000,        # Pro tier - 5,000/month
+            "ultra": 25000,     # Ultra tier - 25,000/month
+            "mega": 100000      # MEGA tier - 100,000/month
+        }
+        
+        # Per-second rate limits (requests per second)
+        self.tier_rps = {
+            "public": 1,        # 1 req/sec
+            "free": 1,          # 1 req/sec
+            "pro": 10,          # 10 req/sec
+            "ultra": 50,        # 50 req/sec
+            "mega": 200         # 200 req/sec
+        }
+        
+        # Start cleanup thread
+        self._start_cleanup()
+        logger.info("✅ Rate limiter initialized with RapidAPI matching tiers")
+    
+    def _get_identifier(self, request: Request, api_key: Optional[str]) -> str:
+        """Get unique identifier for rate limiting (IP + API Key if available)"""
+        client_ip = request.client.host if request.client else "unknown"
+        if api_key:
+            # Hash the API key for privacy
+            hashed = hashlib.sha256(api_key.encode()).hexdigest()[:16]
+            return f"key_{hashed}"
+        return f"ip_{client_ip}"
+    
+    def _get_month(self) -> str:
+        """Get current month as string (for monthly quotas)"""
+        return datetime.now().strftime("%Y-%m")
+    
+    def _check_per_second(self, identifier: str, tier: str, current_time: float) -> bool:
+        """Check per-second rate limit"""
+        rps_limit = self.tier_rps.get(tier, 1)
+        
+        # Clean old requests (older than 1 second)
+        self.per_second_usage[identifier][tier] = [
+            t for t in self.per_second_usage[identifier].get(tier, [])
+            if current_time - t < 1.0
+        ]
+        
+        # Check limit
+        if len(self.per_second_usage[identifier].get(tier, [])) >= rps_limit:
+            return False
+        
+        # Add current request
+        if tier not in self.per_second_usage[identifier]:
+            self.per_second_usage[identifier][tier] = []
+        self.per_second_usage[identifier][tier].append(current_time)
+        return True
+    
+    def _seconds_until_month_end(self) -> int:
+        """Calculate seconds until end of current month"""
+        now = datetime.now()
+        # Get first day of next month
+        if now.month == 12:
+            next_month = datetime(now.year + 1, 1, 1)
+        else:
+            next_month = datetime(now.year, now.month + 1, 1)
+        return int((next_month - now).total_seconds())
+    
+    def check_limit(self, request: Request, api_key: Optional[str], tier: str) -> Tuple[bool, Dict]:
+        """
+        Check if request is within rate limits
+        Returns: (allowed, headers)
+        """
+        identifier = self._get_identifier(request, api_key)
+        current_month = self._get_month()
+        current_time = time.time()
+        
+        # Get monthly limit
+        monthly_limit = self.tier_limits.get(tier, 100)
+        rps_limit = self.tier_rps.get(tier, 1)
+        
+        with self.lock:
+            # Check per-second limit first
+            if not self._check_per_second(identifier, tier, current_time):
+                return False, {
+                    "X-RateLimit-Limit": str(monthly_limit),
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": str(self._seconds_until_month_end()),
+                    "X-RateLimit-Tier": tier,
+                    "X-RateLimit-PerSecond": str(rps_limit),
+                    "Retry-After": "1"
+                }
+            
+            # Get current monthly count
+            current_monthly = self.usage[identifier][current_month]
+            
+            # Calculate remaining
+            remaining = max(0, monthly_limit - current_monthly)
+            
+            # Prepare headers
+            headers = {
+                "X-RateLimit-Limit": str(monthly_limit),
+                "X-RateLimit-Remaining": str(remaining),
+                "X-RateLimit-Reset": str(self._seconds_until_month_end()),
+                "X-RateLimit-Tier": tier,
+                "X-RateLimit-PerSecond": str(rps_limit)
+            }
+            
+            # Check if monthly limit exceeded
+            if current_monthly >= monthly_limit:
+                return False, headers
+            
+            # Increment count
+            self.usage[identifier][current_month] = current_monthly + 1
+            return True, headers
+    
+    def _start_cleanup(self):
+        """Start background thread to clean old data"""
+        def cleanup():
+            while True:
+                time.sleep(3600)  # Run every hour
+                try:
+                    current_month = self._get_month()
+                    with self.lock:
+                        # Remove entries older than current month
+                        to_delete = []
+                        for identifier in self.usage:
+                            for month in list(self.usage[identifier].keys()):
+                                if month < current_month:
+                                    del self.usage[identifier][month]
+                            if not self.usage[identifier]:
+                                to_delete.append(identifier)
+                        for identifier in to_delete:
+                            del self.usage[identifier]
+                        
+                        # Clean old per-second data (older than 1 second)
+                        current_time = time.time()
+                        for identifier in list(self.per_second_usage.keys()):
+                            for tier in list(self.per_second_usage[identifier].keys()):
+                                self.per_second_usage[identifier][tier] = [
+                                    t for t in self.per_second_usage[identifier][tier]
+                                    if current_time - t < 1.0
+                                ]
+                                if not self.per_second_usage[identifier][tier]:
+                                    del self.per_second_usage[identifier][tier]
+                            if not self.per_second_usage[identifier]:
+                                del self.per_second_usage[identifier]
+                                
+                except Exception as e:
+                    logger.error(f"Rate limit cleanup error: {e}")
+        
+        thread = threading.Thread(target=cleanup, daemon=True)
+        thread.start()
+        logger.info("✅ Rate limiter cleanup thread started")
+
+# Initialize rate limiter
+rate_limiter = RateLimiter()
+
+# ============================================================================
+# END RATE LIMITING SYSTEM
+# ============================================================================
 
 # Initialize FastAPI
 app = FastAPI(
@@ -88,18 +270,49 @@ class ErrorResponse(BaseModel):
 # API Key authentication (optional - for paid tiers)
 API_KEYS = {
     "demo_key": {"tier": "free", "rate_limit": 100},
-    "pro_key_2026": {"tier": "pro", "rate_limit": 10000}
+    "pro_key_2026": {"tier": "pro", "rate_limit": 5000},
+    "ultra_key_2026": {"tier": "ultra", "rate_limit": 25000},
+    "mega_key_2026": {"tier": "mega", "rate_limit": 100000}
 }
 
 def verify_api_key(x_api_key: Optional[str] = Header(None)):
     """Verify API key for authenticated endpoints"""
     if x_api_key is None:
-        return {"tier": "public", "rate_limit": 10}
+        return {"tier": "public", "rate_limit": 100}
     
     if x_api_key in API_KEYS:
         return API_KEYS[x_api_key]
     
     raise HTTPException(status_code=401, detail="Invalid API key")
+
+# Rate limiting dependency
+async def check_rate_limit(
+    request: Request,
+    api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    auth: dict = Depends(verify_api_key)
+):
+    """Dependency to check rate limits for all endpoints"""
+    allowed, headers = rate_limiter.check_limit(request, api_key, auth['tier'])
+    
+    if not allowed:
+        # Calculate days until reset
+        seconds_to_reset = int(headers.get("X-RateLimit-Reset", 86400))
+        days_to_reset = seconds_to_reset // 86400
+        
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "Rate limit exceeded",
+                "message": f"Monthly limit of {headers['X-RateLimit-Limit']} requests reached",
+                "upgrade": "https://rapidapi.com/emyasenc/api/yasen-alpha-bitcoin-signals",
+                "reset_in": f"{days_to_reset} days",
+                "tier": auth['tier'],
+                "per_second_limit": headers.get("X-RateLimit-PerSecond", "1")
+            },
+            headers=headers
+        )
+    
+    return headers
 
 # Load predictor (cached)
 _predictor = None
@@ -520,6 +733,8 @@ async def health_check():
 
 @app.get("/signal", response_model=SignalResponse, tags=["Trading"])
 async def get_signal(
+    request: Request,
+    rate_headers: dict = Depends(check_rate_limit),
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
@@ -540,6 +755,7 @@ async def get_signal(
             return JSONResponse(
                 content=cached_signal,
                 headers={
+                    **rate_headers,
                     "X-Cache": "HIT",
                     "X-Cache-Hit-Rate": cache.get_stats()['hit_rate']
                 }
@@ -564,9 +780,14 @@ async def get_signal(
         
         return JSONResponse(
             content=response,
-            headers={"X-Cache": "MISS"}
+            headers={
+                **rate_headers,
+                "X-Cache": "MISS"
+            }
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting signal: {e}")
         raise HTTPException(
@@ -576,7 +797,9 @@ async def get_signal(
 
 @app.get("/signal/{timeframe}", tags=["Trading"])
 async def get_signal_timeframe(
+    request: Request,
     timeframe: str,
+    rate_headers: dict = Depends(check_rate_limit),
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
@@ -613,6 +836,7 @@ async def get_signal_timeframe(
             return JSONResponse(
                 content=cached_signal,
                 headers={
+                    **rate_headers,
                     "X-Cache": "HIT",
                     "X-Timeframe": timeframe
                 }
@@ -690,6 +914,7 @@ async def get_signal_timeframe(
         return JSONResponse(
             content=response,
             headers={
+                **rate_headers,
                 "X-Cache": "MISS",
                 "X-Timeframe": timeframe
             }
@@ -704,20 +929,28 @@ async def get_signal_timeframe(
         raise HTTPException(status_code=503, detail=f"Signal temporarily unavailable: {str(e)}")
 
 @app.get("/available-timeframes", tags=["Info"])
-async def get_available_timeframes():
+async def get_available_timeframes(
+    request: Request,
+    rate_headers: dict = Depends(check_rate_limit)
+):
     """Get list of available timeframes and your tier access"""
-    return {
-        "timeframes": ["5min", "15min", "1h", "4h", "1d"],
-        "tier_access": {
-            "free": ["1h"],
-            "pro": ["15min", "1h", "4h"],
-            "ultra": ["5min", "15min", "1h", "4h", "1d"]
+    return JSONResponse(
+        content={
+            "timeframes": ["5min", "15min", "1h", "4h", "1d"],
+            "tier_access": {
+                "free": ["1h"],
+                "pro": ["15min", "1h", "4h"],
+                "ultra": ["5min", "15min", "1h", "4h", "1d"]
+            },
+            "default": "1h"
         },
-        "default": "1h"
-    }
+        headers=rate_headers
+    )
 
 @app.get("/price", response_model=PriceResponse, tags=["Market Data"])
 async def get_price(
+    request: Request,
+    rate_headers: dict = Depends(check_rate_limit),
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
@@ -730,7 +963,10 @@ async def get_price(
         if cached_price:
             return JSONResponse(
                 content=cached_price,
-                headers={"X-Cache": "HIT"}
+                headers={
+                    **rate_headers,
+                    "X-Cache": "HIT"
+                }
             )
         
         # Cache miss - generate new price
@@ -754,7 +990,10 @@ async def get_price(
         
         return JSONResponse(
             content=response,
-            headers={"X-Cache": "MISS"}
+            headers={
+                **rate_headers,
+                "X-Cache": "MISS"
+            }
         )
     
     except Exception as e:
@@ -766,6 +1005,8 @@ async def get_price(
 
 @app.get("/stats", response_model=StatsResponse, tags=["Model Info"])
 async def get_stats(
+    request: Request,
+    rate_headers: dict = Depends(check_rate_limit),
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
@@ -777,32 +1018,40 @@ async def get_stats(
         model_path = 'data/models/yasen_alpha_champion.joblib'
         model_data = joblib.load(model_path)
         
-        return StatsResponse(
-            win_rate=0.5904,  # Fixed from latest backtest
-            total_trades=8274,
-            sharpe_ratio=0.42,
-            features=78,
-            data_history_years=9.2,
-            model_version="2.0.0",
-            last_updated=datetime.now().isoformat()
+        return JSONResponse(
+            content=StatsResponse(
+                win_rate=0.5904,  # Fixed from latest backtest
+                total_trades=8274,
+                sharpe_ratio=0.42,
+                features=78,
+                data_history_years=9.2,
+                model_version="2.0.0",
+                last_updated=datetime.now().isoformat()
+            ).dict(),
+            headers=rate_headers
         )
     
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
         # Return cached/default stats if model not available
-        return StatsResponse(
-            win_rate=0.5904,
-            total_trades=8274,
-            sharpe_ratio=0.42,
-            features=78,
-            data_history_years=9.2,
-            model_version="2.0.0",
-            last_updated=datetime.now().isoformat()
+        return JSONResponse(
+            content=StatsResponse(
+                win_rate=0.5904,
+                total_trades=8274,
+                sharpe_ratio=0.42,
+                features=78,
+                data_history_years=9.2,
+                model_version="2.0.0",
+                last_updated=datetime.now().isoformat()
+            ).dict(),
+            headers=rate_headers
         )
 
 @app.get("/history", tags=["Historical"])
 async def get_history(
+    request: Request,
     days: int = 7,
+    rate_headers: dict = Depends(check_rate_limit),
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
@@ -844,13 +1093,16 @@ async def get_history(
                 'confidence': round(float(pred), 4)
             })
         
-        return {
-            'symbol': 'BTC/USD',
-            'days': days,
-            'data_points': len(signals),
-            'signals': signals,
-            'timestamp': datetime.now().isoformat()
-        }
+        return JSONResponse(
+            content={
+                'symbol': 'BTC/USD',
+                'days': days,
+                'data_points': len(signals),
+                'signals': signals,
+                'timestamp': datetime.now().isoformat()
+            },
+            headers=rate_headers
+        )
     
     except Exception as e:
         logger.error(f"Error getting history: {e}")
@@ -860,7 +1112,10 @@ async def get_history(
         )
 
 @app.get("/model-info", tags=["Model Info"])
-async def model_info():
+async def model_info(
+    request: Request,
+    rate_headers: dict = Depends(check_rate_limit)
+):
     """Detailed model information for debugging"""
     try:
         predictor = get_predictor()
@@ -881,18 +1136,24 @@ async def model_info():
         if 'params' in model_data:
             info['parameters'] = model_data['params']
         
-        return info
+        return JSONResponse(content=info, headers=rate_headers)
     
     except Exception as e:
         logger.error(f"Error getting model info: {e}")
-        return {"error": "Model info unavailable"}
+        return JSONResponse(
+            content={"error": "Model info unavailable"},
+            headers=rate_headers
+        )
 
 @app.get("/rate-limit", tags=["Info"])
-async def rate_limit_info(api_key: Optional[str] = Header(None, alias="X-API-Key")):
+async def rate_limit_info(
+    request: Request,
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
+):
     """Get rate limit information for your API key"""
     if api_key and api_key in API_KEYS:
         return API_KEYS[api_key]
-    return {"tier": "public", "rate_limit": 10}
+    return {"tier": "public", "rate_limit": 100}
 
 # Error handlers
 @app.exception_handler(404)
@@ -919,36 +1180,21 @@ async def internal_error_handler(request, exc):
     )
 
 @app.get("/cache-stats", tags=["Monitoring"])
-async def get_cache_stats():
+async def get_cache_stats(
+    request: Request,
+    rate_headers: dict = Depends(check_rate_limit)
+):
     """Get cache performance statistics"""
-    return cache.get_stats()
-
-# Error handlers
-@app.exception_handler(404)
-async def not_found_handler(request, exc):
     return JSONResponse(
-        status_code=404,
-        content=ErrorResponse(
-            error="Endpoint not found",
-            code=404,
-            timestamp=datetime.now().isoformat()
-        ).dict()
-    )
-
-@app.exception_handler(500)
-async def internal_error_handler(request, exc):
-    logger.error(f"Internal server error: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content=ErrorResponse(
-            error="Internal server error",
-            code=500,
-            timestamp=datetime.now().isoformat()
-        ).dict()
+        content=cache.get_stats(),
+        headers=rate_headers
     )
 
 @app.get("/live-stats", tags=["Proof"])
-async def get_live_stats():
+async def get_live_stats(
+    request: Request,
+    rate_headers: dict = Depends(check_rate_limit)
+):
     """
     📊 LIVE PROOF DASHBOARD - See real-time performance metrics
     This endpoint shows actual cache performance and model stats
@@ -1013,8 +1259,9 @@ async def get_live_stats():
             ],
             "call_to_action": {
                 "free_tier": "100 requests/month",
-                "pro_tier": "$19/month - Email alerts + history",
-                "ultra_tier": "$49/month - Telegram bot + multi-timeframe",
+                "pro_tier": "$29/month - 5,000 calls, 10/sec",
+                "ultra_tier": "$79/month - 25,000 calls, 50/sec",
+                "mega_tier": "$199/month - 100,000 calls, 200/sec",
                 "signup_url": "https://rapidapi.com/emyasenc/api/yasen-alpha-bitcoin-signals"
             },
             "timestamp": datetime.now().isoformat()
@@ -1023,6 +1270,7 @@ async def get_live_stats():
         return JSONResponse(
             content=stats,
             headers={
+                **rate_headers,
                 "X-Cache-Status": "live",
                 "X-Proof": "verified",
                 "X-Hit-Rate": cache_stats['hit_rate']
@@ -1041,12 +1289,15 @@ async def get_live_stats():
                     "github": "https://github.com/emyasenc/YASEN-ALPHA-ML-Trading-System"
                 }
             },
-            status_code=503
+            status_code=503,
+            headers=rate_headers
         )
 
 @app.get("/signal-strength", tags=["Trading"])
 async def get_signal_strength(
+    request: Request,
     timeframe: str = "1h",
+    rate_headers: dict = Depends(check_rate_limit),
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
@@ -1082,7 +1333,11 @@ async def get_signal_strength(
             logger.info(f"✅ Cache HIT for strength {timeframe}")
             return JSONResponse(
                 content=cached,
-                headers={"X-Cache": "HIT", "X-Timeframe": timeframe}
+                headers={
+                    **rate_headers,
+                    "X-Cache": "HIT",
+                    "X-Timeframe": timeframe
+                }
             )
         
         logger.info(f"⚠️ Cache MISS for strength {timeframe}")
@@ -1171,7 +1426,11 @@ async def get_signal_strength(
         
         return JSONResponse(
             content=response,
-            headers={"X-Cache": "MISS", "X-Timeframe": timeframe}
+            headers={
+                **rate_headers,
+                "X-Cache": "MISS",
+                "X-Timeframe": timeframe
+            }
         )
     
     except HTTPException:
@@ -1184,8 +1443,10 @@ async def get_signal_strength(
 
 @app.get("/levels", tags=["Technical Analysis"])
 async def get_support_resistance(
+    request: Request,
     timeframe: str = "1h",
     lookback: int = 50,
+    rate_headers: dict = Depends(check_rate_limit),
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
@@ -1226,7 +1487,11 @@ async def get_support_resistance(
         if cached:
             return JSONResponse(
                 content=cached,
-                headers={"X-Cache": "HIT", "X-Timeframe": timeframe}
+                headers={
+                    **rate_headers,
+                    "X-Cache": "HIT",
+                    "X-Timeframe": timeframe
+                }
             )
         
         # Get data
@@ -1256,7 +1521,11 @@ async def get_support_resistance(
         
         return JSONResponse(
             content=response,
-            headers={"X-Cache": "MISS", "X-Timeframe": timeframe}
+            headers={
+                **rate_headers,
+                "X-Cache": "MISS",
+                "X-Timeframe": timeframe
+            }
         )
     
     except HTTPException:
@@ -1281,6 +1550,8 @@ def get_trading_strategy(trend, support_dist, resistance_dist):
 
 @app.get("/webhooks", tags=["Webhooks"])
 async def list_webhooks(
+    request: Request,
+    rate_headers: dict = Depends(check_rate_limit),
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
@@ -1289,11 +1560,13 @@ async def list_webhooks(
         raise HTTPException(status_code=403, detail="Webhooks require Pro or Ultra tier")
     
     webhooks = webhook_manager.get_user_webhooks(api_key or "public")
-    return {"webhooks": webhooks}
+    return JSONResponse(content={"webhooks": webhooks}, headers=rate_headers)
 
 @app.post("/webhooks/register", tags=["Webhooks"])
 async def register_webhook(
-    request: dict,
+    request: Request,
+    webhook_request: dict,
+    rate_headers: dict = Depends(check_rate_limit),
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
@@ -1317,13 +1590,13 @@ async def register_webhook(
         raise HTTPException(status_code=403, detail="Webhooks require Pro or Ultra tier")
     
     # Validate URL
-    url = request.get('url')
+    url = webhook_request.get('url')
     if not url or not url.startswith(('http://', 'https://')):
         raise HTTPException(status_code=400, detail="Invalid URL")
     
     # Validate events
     valid_events = ['signal_change', 'level_break', 'price_alert', 'whale_alert']
-    events = request.get('events', ['signal_change'])
+    events = webhook_request.get('events', ['signal_change'])
     for event in events:
         if event not in valid_events:
             raise HTTPException(status_code=400, detail=f"Invalid event: {event}")
@@ -1337,7 +1610,7 @@ async def register_webhook(
         user_id=api_key or "public",
         url=url,
         events=events,
-        secret=request.get('secret')
+        secret=webhook_request.get('secret')
     )
     
     # Send test webhook
@@ -1348,31 +1621,41 @@ async def register_webhook(
     }
     webhook_manager.trigger_event("test", test_data)
     
-    return {
-        "status": "success",
-        "message": "Webhook registered",
-        "webhook": webhook,
-        "test_sent": True
-    }
+    return JSONResponse(
+        content={
+            "status": "success",
+            "message": "Webhook registered",
+            "webhook": webhook,
+            "test_sent": True
+        },
+        headers=rate_headers
+    )
 
 @app.delete("/webhooks/{webhook_id}", tags=["Webhooks"])
 async def delete_webhook(
+    request: Request,
     webhook_id: str,
+    rate_headers: dict = Depends(check_rate_limit),
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
     """Delete a webhook"""
     webhook_manager.unregister(api_key or "public", webhook_id)
-    return {"status": "success", "message": "Webhook deleted"}
+    return JSONResponse(
+        content={"status": "success", "message": "Webhook deleted"},
+        headers=rate_headers
+    )
 
 @app.post("/webhooks/test", tags=["Webhooks"])
 async def test_webhook(
-    request: dict,
+    request: Request,
+    webhook_request: dict,
+    rate_headers: dict = Depends(check_rate_limit),
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
     """Send a test webhook to your URL"""
-    url = request.get('url')
+    url = webhook_request.get('url')
     if not url:
         raise HTTPException(status_code=400, detail="URL required")
     
@@ -1389,15 +1672,17 @@ async def test_webhook(
     
     try:
         response = requests.post(url, json=test_data, timeout=5)
-        return {
-            "status": "sent",
-            "response_code": response.status_code,
-            "response_text": response.text[:200]
-        }
+        return JSONResponse(
+            content={
+                "status": "sent",
+                "response_code": response.status_code,
+                "response_text": response.text[:200]
+            },
+            headers=rate_headers
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Webhook failed: {str(e)}")
 
-# KEEP ALIVE SYSTEM - Prevents Render from sleeping
 # KEEP ALIVE SYSTEM - Prevents Render from sleeping
 def keep_alive():
     """Self-ping every 4-6 minutes to keep Render awake"""
@@ -1424,7 +1709,7 @@ def keep_alive():
         except Exception as e:
             logger.error(f"Self-ping failed: {e}")
             pass  # Silent fail - won't crash
-        
+
 # Start keep-alive in background thread (works on Render AND locally)
 keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
 keep_alive_thread.start()
