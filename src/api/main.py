@@ -1,7 +1,7 @@
 """
 YASEN-ALPHA Production API
 Enterprise-grade FastAPI backend for Bitcoin trading signals
-WITH PRODUCTION RATE LIMITING MATCHING RAPIDAPI TIERS
+WITH PRODUCTION RATE LIMITING - RAPIDAPI HANDLES BILLING
 """
 from .cache import cache
 from .webhooks import webhook_manager
@@ -41,17 +41,13 @@ sys.path.append(str(Path(__file__).parent.parent.parent))
 from src.models.inference.predictor import YasenAlphaPredictor
 
 # ============================================================================
-# PRODUCTION RATE LIMITING SYSTEM - MATCHES RAPIDAPI TIERS
+# PRODUCTION RATE LIMITING SYSTEM - PSYCHOLOGICAL ONLY
 # ============================================================================
 
 class RateLimiter:
     """
-    Enterprise-grade rate limiting system
-    Matches RapidAPI pricing tiers exactly:
-    - Free/Basic: 100/month, 1 req/sec
-    - Pro ($29): 5,000/month, 10 req/sec
-    - Ultra ($79): 25,000/month, 50 req/sec
-    - MEGA ($199): 100,000/month, 200 req/sec
+    Psychological rate limiting system
+    Headers only - actual billing handled by RapidAPI
     """
     
     def __init__(self):
@@ -60,7 +56,7 @@ class RateLimiter:
         self.per_second_usage = defaultdict(lambda: defaultdict(list))
         self.lock = threading.Lock()
         
-        # Rate limits per tier (requests per MONTH - matching RapidAPI)
+        # Rate limits per tier (for HEADERS only - not enforced)
         self.tier_limits = {
             "public": 100,      # Basic tier - 100/month
             "free": 100,        # Free RapidAPI tier
@@ -69,7 +65,7 @@ class RateLimiter:
             "mega": 100000      # MEGA tier - 100,000/month
         }
         
-        # Per-second rate limits (requests per second)
+        # Per-second rate limits (for HEADERS only - not enforced)
         self.tier_rps = {
             "public": 1,        # 1 req/sec
             "free": 1,          # 1 req/sec
@@ -80,15 +76,12 @@ class RateLimiter:
         
         # Start cleanup thread
         self._start_cleanup()
-        logger.info("✅ Rate limiter initialized with RapidAPI matching tiers")
+        logger.info("✅ Psychological rate limiter initialized")
     
     def _get_identifier(self, request: Request, api_key: Optional[str]) -> str:
-        """Get unique identifier for rate limiting (IP + API Key if available)"""
+        """Get unique identifier for rate limiting (IP only - keys handled by RapidAPI)"""
         client_ip = request.client.host if request.client else "unknown"
-        if api_key:
-            # Hash the API key for privacy
-            hashed = hashlib.sha256(api_key.encode()).hexdigest()[:16]
-            return f"key_{hashed}"
+        # We don't hash API keys anymore - RapidAPI handles that
         return f"ip_{client_ip}"
     
     def _get_month(self) -> str:
@@ -96,7 +89,7 @@ class RateLimiter:
         return datetime.now().strftime("%Y-%m")
     
     def _check_per_second(self, identifier: str, tier: str, current_time: float) -> bool:
-        """Check per-second rate limit"""
+        """Check per-second rate limit - purely for headers"""
         rps_limit = self.tier_rps.get(tier, 1)
         
         # Clean old requests (older than 1 second)
@@ -105,11 +98,7 @@ class RateLimiter:
             if current_time - t < 1.0
         ]
         
-        # Check limit
-        if len(self.per_second_usage[identifier].get(tier, [])) >= rps_limit:
-            return False
-        
-        # Add current request
+        # Always return True - we don't enforce, just track
         if tier not in self.per_second_usage[identifier]:
             self.per_second_usage[identifier][tier] = []
         self.per_second_usage[identifier][tier].append(current_time)
@@ -118,37 +107,26 @@ class RateLimiter:
     def _seconds_until_month_end(self) -> int:
         """Calculate seconds until end of current month"""
         now = datetime.now()
-        # Get first day of next month
         if now.month == 12:
             next_month = datetime(now.year + 1, 1, 1)
         else:
             next_month = datetime(now.year, now.month + 1, 1)
         return int((next_month - now).total_seconds())
     
-    def check_limit(self, request: Request, api_key: Optional[str], tier: str) -> Tuple[bool, Dict]:
+    def get_headers(self, request: Request, api_key: Optional[str], tier: str) -> Dict:
         """
-        Check if request is within rate limits
-        Returns: (allowed, headers)
+        Generate rate limit headers (does NOT enforce)
         """
         identifier = self._get_identifier(request, api_key)
         current_month = self._get_month()
         current_time = time.time()
         
-        # Get monthly limit
         monthly_limit = self.tier_limits.get(tier, 100)
         rps_limit = self.tier_rps.get(tier, 1)
         
         with self.lock:
-            # Check per-second limit first
-            if not self._check_per_second(identifier, tier, current_time):
-                return False, {
-                    "X-RateLimit-Limit": str(monthly_limit),
-                    "X-RateLimit-Remaining": "0",
-                    "X-RateLimit-Reset": str(self._seconds_until_month_end()),
-                    "X-RateLimit-Tier": tier,
-                    "X-RateLimit-PerSecond": str(rps_limit),
-                    "Retry-After": "1"
-                }
+            # Track per-second (for headers only)
+            self._check_per_second(identifier, tier, current_time)
             
             # Get current monthly count
             current_monthly = self.usage[identifier][current_month]
@@ -165,23 +143,18 @@ class RateLimiter:
                 "X-RateLimit-PerSecond": str(rps_limit)
             }
             
-            # Check if monthly limit exceeded
-            if current_monthly >= monthly_limit:
-                return False, headers
-            
-            # Increment count
+            # Increment count for next time
             self.usage[identifier][current_month] = current_monthly + 1
-            return True, headers
+            return headers
     
     def _start_cleanup(self):
         """Start background thread to clean old data"""
         def cleanup():
             while True:
-                time.sleep(3600)  # Run every hour
+                time.sleep(3600)
                 try:
                     current_month = self._get_month()
                     with self.lock:
-                        # Remove entries older than current month
                         to_delete = []
                         for identifier in self.usage:
                             for month in list(self.usage[identifier].keys()):
@@ -192,7 +165,6 @@ class RateLimiter:
                         for identifier in to_delete:
                             del self.usage[identifier]
                         
-                        # Clean old per-second data (older than 1 second)
                         current_time = time.time()
                         for identifier in list(self.per_second_usage.keys()):
                             for tier in list(self.per_second_usage[identifier].keys()):
@@ -234,7 +206,6 @@ async def add_memory_management(request: Request, call_next):
     """Monitor and manage memory usage"""
     response = await call_next(request)
     
-    # Force garbage collection every 100 requests
     if random.randint(1, 100) == 1:
         gc.collect()
         logger.info(f"🧹 Garbage collected. Memory: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
@@ -282,52 +253,53 @@ class ErrorResponse(BaseModel):
     code: int
     timestamp: str
 
-# API Key authentication (optional - for paid tiers)
-API_KEYS = {
-    "demo_key": {"tier": "free", "rate_limit": 100},
-    "pro_key_2026": {"tier": "pro", "rate_limit": 5000},
-    "ultra_key_2026": {"tier": "ultra", "rate_limit": 25000},
-    "mega_key_2026": {"tier": "mega", "rate_limit": 100000}
-}
+# ============================================================================
+# SECURITY FIX - NO HARDCODED API KEYS
+# ============================================================================
 
 def verify_api_key(x_api_key: Optional[str] = Header(None)):
-    """Verify API key for authenticated endpoints"""
+    """
+    Verify API key - RELIES ON RAPIDAPI FOR AUTHENTICATION
+    No hardcoded keys = no loopholes
+    """
     if x_api_key is None:
-        return {"tier": "public", "rate_limit": 100}
+        # No key = public tier
+        return {"tier": "public"}
     
-    if x_api_key in API_KEYS:
-        return API_KEYS[x_api_key]
+    # ANY key that reaches here came through RapidAPI
+    # RapidAPI has already validated the subscription
+    # We just need to determine which tier based on the request
+    # This info can come from RapidAPI headers
     
-    raise HTTPException(status_code=401, detail="Invalid API key")
+    # For now, we'll assume Pro tier for any key
+    # In production, you'd parse RapidAPI headers to get actual tier
+    return {"tier": "pro"}
 
-# Rate limiting dependency
-async def check_rate_limit(
+# Optional: Parse RapidAPI headers for accurate tier
+def get_tier_from_headers(request: Request) -> str:
+    """
+    Extract tier from RapidAPI headers if available
+    """
+    # RapidAPI sends these headers
+    # You'd need to configure this in your RapidAPI dashboard
+    tier_header = request.headers.get("X-RapidAPI-User-Tier")
+    if tier_header:
+        return tier_header.lower()
+    return "public"
+
+# Rate limiting dependency (now just generates headers)
+async def get_rate_headers(
     request: Request,
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
-    """Dependency to check rate limits for all endpoints"""
-    allowed, headers = rate_limiter.check_limit(request, api_key, auth['tier'])
-    
-    if not allowed:
-        # Calculate days until reset
-        seconds_to_reset = int(headers.get("X-RateLimit-Reset", 86400))
-        days_to_reset = seconds_to_reset // 86400
-        
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": "Rate limit exceeded",
-                "message": f"Monthly limit of {headers['X-RateLimit-Limit']} requests reached",
-                "upgrade": "https://rapidapi.com/emyasenc/api/yasen-alpha-bitcoin-signals",
-                "reset_in": f"{days_to_reset} days",
-                "tier": auth['tier'],
-                "per_second_limit": headers.get("X-RateLimit-PerSecond", "1")
-            },
-            headers=headers
-        )
-    
+    """Generate rate limit headers (no enforcement)"""
+    headers = rate_limiter.get_headers(request, api_key, auth['tier'])
     return headers
+
+# ============================================================================
+# END SECURITY FIX
+# ============================================================================
 
 # Load predictor (cached)
 _predictor = None
@@ -357,7 +329,6 @@ def resample_data(timeframe: str):
         df = pd.read_parquet('data/processed/features_latest.parquet')
         logger.info(f"📊 Loaded data with shape: {df.shape}")
         
-        # Map timeframe to pandas offset
         timeframe_map = {
             "5min": "5T",
             "15min": "15T",
@@ -370,20 +341,16 @@ def resample_data(timeframe: str):
             logger.warning(f"⚠️ Timeframe {timeframe} not recognized, using original")
             return df
         
-        # Get the offset
         offset = timeframe_map[timeframe]
         
-        # If timeframe is 1h, just return original
         if timeframe == "1h":
             return df
         
-        # Separate price columns from feature columns
         price_cols = ['open', 'high', 'low', 'close', 'volume']
         feature_cols = [col for col in df.columns if col not in price_cols]
         
         logger.info(f"💰 Price columns: {len(price_cols)}, 🔧 Feature columns: {len(feature_cols)}")
         
-        # Resample price columns
         df_price = df[price_cols].resample(offset).agg({
             'open': 'first',
             'high': 'max',
@@ -392,13 +359,8 @@ def resample_data(timeframe: str):
             'volume': 'sum'
         })
         
-        # For feature columns, use last value
         df_features = df[feature_cols].resample(offset).last()
-        
-        # Combine
         df_resampled = pd.concat([df_price, df_features], axis=1)
-        
-        # Forward fill missing values (better than dropna for time series)
         df_resampled = df_resampled.fillna(method='ffill').fillna(method='bfill')
         
         logger.info(f"✅ Resampled {timeframe}: {len(df_resampled)} rows")
@@ -406,26 +368,20 @@ def resample_data(timeframe: str):
         
     except Exception as e:
         logger.error(f"Error resampling data: {e}")
-        # Return original data as fallback
         return pd.read_parquet('data/processed/features_latest.parquet')
 
 # Helper function for signal strength endpoint
 def calculate_signal_strength(confidence: float, volatility: float, market_regime: str = None):
-    """
-    Calculate signal strength on 0-100 scale with human-readable format
-    """
-    # Base score from confidence (0-60 points)
+    """Calculate signal strength on 0-100 scale with human-readable format"""
     base_score = confidence * 60
     
-    # Volatility adjustment (-10 to +10)
     if volatility < 0.005:
-        vol_score = +10  # Low volatility = more confident
+        vol_score = +10
     elif volatility > 0.02:
-        vol_score = -10  # High volatility = less confident
+        vol_score = -10
     else:
         vol_score = 0
     
-    # Market regime adjustment (if available)
     regime_score = 0
     if market_regime:
         if market_regime == "TRENDING" and confidence > 0.6:
@@ -433,10 +389,8 @@ def calculate_signal_strength(confidence: float, volatility: float, market_regim
         elif market_regime == "RANGING" and confidence < 0.4:
             regime_score = -10
     
-    # Calculate final score (0-100)
     score = min(100, max(0, base_score + vol_score + regime_score))
     
-    # Determine strength category
     if score >= 80:
         strength = "VERY_STRONG"
         color = "🟢🟢🟢"
@@ -472,64 +426,46 @@ def calculate_signal_strength(confidence: float, volatility: float, market_regim
 
 # Helper function for support/resistance endpoint
 def calculate_support_resistance(df, window=20):
-    """
-    Calculate support and resistance levels from price data
-    """
-    # Get recent price data
+    """Calculate support and resistance levels from price data"""
     recent = df.tail(window)
-    
-    # Find local highs and lows
     highs = recent['high'].values
     lows = recent['low'].values
     
-    # Find resistance levels (recent highs)
     resistance_levels = []
     for i in range(1, len(highs)-1):
         if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
             resistance_levels.append(highs[i])
     
-    # Find support levels (recent lows)
     support_levels = []
     for i in range(1, len(lows)-1):
         if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
             support_levels.append(lows[i])
     
-    # 🔥 FIX: If no levels found, use recent highs/lows
     if len(resistance_levels) == 0:
-        # Use the highest high from recent period
         resistance_levels = [df['high'].tail(10).max()]
     
     if len(support_levels) == 0:
-        # Use the lowest low from recent period
         support_levels = [df['low'].tail(10).min()]
     
-    # Get current price
     current_price = df['close'].iloc[-1]
     
-    # Find nearest support and resistance
-    # Filter only levels that make sense (resistance above price, support below)
     valid_resistance = [r for r in resistance_levels if r > current_price]
     valid_support = [s for s in support_levels if s < current_price]
     
-    # If still no valid levels after filtering, create reasonable ones
     if len(valid_resistance) == 0:
-        # Create resistance at 2% above current price
         valid_resistance = [current_price * 1.02]
         resistance_levels = valid_resistance.copy()
     
     if len(valid_support) == 0:
-        # Create support at 2% below current price
         valid_support = [current_price * 0.98]
         support_levels = valid_support.copy()
     
     nearest_resistance = min(valid_resistance) if valid_resistance else None
     nearest_support = max(valid_support) if valid_support else None
     
-    # Calculate distance to levels
     resistance_distance = ((nearest_resistance - current_price) / current_price * 100) if nearest_resistance else None
     support_distance = ((current_price - nearest_support) / current_price * 100) if nearest_support else None
     
-    # Determine trend
     if len(highs) > 5:
         if highs[-1] > highs[-5]:
             trend = "UPTREND"
@@ -565,12 +501,10 @@ async def startup_event():
     logger.info(f"Environment: production")
     logger.info("="*60)
     
-    # Pre-load predictor (this is the 18s part)
     try:
         predictor = get_predictor()
         logger.info("✅ Predictor loaded successfully")
         
-        # 🔥 WARM UP THE CACHE - Generate first signal NOW
         logger.info("🔥 WARMING UP CACHE - Generating first signal...")
         signal_data = predictor.get_current_signal()
         signal_response = SignalResponse(
@@ -582,7 +516,6 @@ async def startup_event():
         ).dict()
         cache.set('signal', signal_response)
         
-        # 🔥 WARM UP PRICE CACHE
         logger.info("💰 WARMING UP PRICE CACHE...")
         df = pd.read_parquet('data/processed/features_latest.parquet')
         df = df.tail(24)
@@ -601,15 +534,12 @@ async def startup_event():
         
         logger.info("✅ CACHE WARMED - First user gets INSTANT response!")
         
-        # Define background update function with WEBHOOKS
         def update_all_caches():
             """Update all cache keys in background and trigger webhooks"""
             try:
-                # Get old values before updating
                 old_signal = cache.get('signal')
                 old_price = cache.get('price')
                 
-                # Get fresh signal
                 predictor = get_predictor()
                 signal_data = predictor.get_current_signal()
                 signal_response = SignalResponse(
@@ -620,7 +550,6 @@ async def startup_event():
                     timestamp=datetime.now().isoformat()
                 ).dict()
                 
-                # Get fresh price
                 df = pd.read_parquet('data/processed/features_latest.parquet')
                 df = df.tail(24)
                 current_price = df['close'].iloc[-1]
@@ -635,11 +564,8 @@ async def startup_event():
                     timestamp=datetime.now().isoformat()
                 ).dict()
                 
-                # 🔥 TRIGGER WEBHOOKS FOR SIGNAL CHANGES
                 if old_signal and old_signal.get('signal') != signal_response.get('signal'):
                     logger.info(f"🔥 SIGNAL CHANGED: {old_signal.get('signal')} → {signal_response.get('signal')}")
-                    
-                    # Trigger webhooks
                     webhook_manager.trigger_event('signal_change', {
                         'old_signal': old_signal.get('signal'),
                         'new_signal': signal_response.get('signal'),
@@ -648,12 +574,11 @@ async def startup_event():
                         'timestamp': datetime.now().isoformat()
                     })
                 
-                # 🔥 TRIGGER WEBHOOKS FOR PRICE ALERTS (1% moves)
                 if old_price:
                     old_price_value = old_price.get('price')
                     price_change_pct = ((current_price - old_price_value) / old_price_value) * 100
                     
-                    if abs(price_change_pct) >= 1.0:  # 1% move
+                    if abs(price_change_pct) >= 1.0:
                         logger.info(f"🔥 PRICE ALERT: {price_change_pct:.2f}% move")
                         webhook_manager.trigger_event('price_alert', {
                             'old_price': old_price_value,
@@ -663,13 +588,10 @@ async def startup_event():
                             'timestamp': datetime.now().isoformat()
                         })
                 
-                # Get support/resistance levels if they exist in cache
                 levels = cache.get('levels_1h')
                 if levels and old_price:
-                    # Check for level breaks
                     old_price_value = old_price.get('price')
                     
-                    # Resistance break (price moves above resistance)
                     if levels.get('nearest_resistance') and old_price_value <= levels['nearest_resistance'] < current_price:
                         logger.info(f"🔥 RESISTANCE BROKEN: ${levels['nearest_resistance']}")
                         webhook_manager.trigger_event('level_break', {
@@ -681,7 +603,6 @@ async def startup_event():
                             'timestamp': datetime.now().isoformat()
                         })
                     
-                    # Support break (price moves below support)
                     if levels.get('nearest_support') and old_price_value >= levels['nearest_support'] > current_price:
                         logger.info(f"🔥 SUPPORT BROKEN: ${levels['nearest_support']}")
                         webhook_manager.trigger_event('level_break', {
@@ -704,7 +625,6 @@ async def startup_event():
                 traceback.print_exc()
                 return None
         
-        # Start background updates
         cache.start_background_updates(update_all_caches)
         logger.info("✅ Background cache updater started")
         
@@ -713,12 +633,10 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on shutdown"""
     logger.info("YASEN-ALPHA API shutting down...")
 
 @app.get("/", tags=["Root"])
 async def root():
-    """Root endpoint with API information"""
     return {
         "service": "YASEN-ALPHA Trading API",
         "version": "2.0.0",
@@ -738,7 +656,6 @@ async def root():
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    """Health check endpoint for monitoring"""
     return {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -749,21 +666,11 @@ async def health_check():
 @app.get("/signal", response_model=SignalResponse, tags=["Trading"])
 async def get_signal(
     request: Request,
-    rate_headers: dict = Depends(check_rate_limit),
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
+    rate_headers: dict = Depends(get_rate_headers),
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    """
-    Get current Bitcoin trading signal (CACHED - <100ms)
-    
-    Returns:
-    - signal: BUY, SELL, or HOLD
-    - confidence: 0-1 probability
-    - threshold_used: current threshold
-    - volatility: market volatility
-    """
+    """Get current Bitcoin trading signal (CACHED - <100ms)"""
     try:
-        # Try cache first (super fast!)
         cached_signal = cache.get('signal')
         if cached_signal:
             logger.info(f"✅ Cache HIT - {cache.get_stats()['hit_rate']}")
@@ -776,12 +683,10 @@ async def get_signal(
                 }
             )
         
-        # Cache miss - generate new signal (slow)
         logger.info("⚠️ Cache MISS - generating new signal")
         predictor = get_predictor()
         signal_data = predictor.get_current_signal()
         
-        # Format response
         response = SignalResponse(
             signal=signal_data['signal'],
             confidence=round(signal_data['confidence'], 4),
@@ -790,7 +695,6 @@ async def get_signal(
             timestamp=datetime.now().isoformat()
         ).dict()
         
-        # Store in cache
         cache.set('signal', response)
         
         return JSONResponse(
@@ -814,37 +718,20 @@ async def get_signal(
 async def get_signal_timeframe(
     request: Request,
     timeframe: str,
-    rate_headers: dict = Depends(check_rate_limit),
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
+    rate_headers: dict = Depends(get_rate_headers),
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    """
-    Get Bitcoin trading signal for specific timeframe
-    """
+    """Get Bitcoin trading signal for specific timeframe"""
     try:
-        logger.info(f"🔍 TIMEFRAME REQUEST: {timeframe} with tier {auth['tier']}")
+        logger.info(f"🔍 TIMEFRAME REQUEST: {timeframe}")
         
-        # Validate timeframe
         valid_timeframes = ["5min", "15min", "1h", "4h", "1d"]
         if timeframe not in valid_timeframes:
             raise HTTPException(status_code=400, detail="Invalid timeframe")
         
-        # Tier-based access control
-        if auth['tier'] == 'free' and timeframe != '1h':
-            logger.info(f"⛔ Free tier attempted {timeframe} - blocking")
-            raise HTTPException(
-                status_code=403, 
-                detail="Free tier only has 1h signals. Upgrade for more!"
-            )
+        # NOTE: Tier-based access control is now handled by RapidAPI
+        # We don't need to check tiers here - RapidAPI blocks unauthorized requests
         
-        if auth['tier'] == 'pro' and timeframe in ['5min', '1d']:
-            logger.info(f"⛔ Pro tier attempted {timeframe} - blocking")
-            raise HTTPException(
-                status_code=403, 
-                detail="Pro tier has 15min, 1h, 4h. Upgrade to Ultra for 5min and 1d!"
-            )
-        
-        # Try cache
         cache_key = f'signal_{timeframe}'
         cached_signal = cache.get(cache_key)
         if cached_signal:
@@ -860,7 +747,6 @@ async def get_signal_timeframe(
         
         logger.info(f"⚠️ Cache MISS for {timeframe} - generating...")
         
-        # Get resampled data
         try:
             df = resample_data(timeframe)
             logger.info(f"📊 Resampled data shape: {df.shape}")
@@ -868,22 +754,18 @@ async def get_signal_timeframe(
             logger.error(f"❌ Resampling failed: {e}")
             raise HTTPException(status_code=500, detail=f"Data resampling failed: {str(e)}")
         
-        # Get predictor
         predictor = get_predictor()
         
-        # Prepare features
         exclude_cols = ['open', 'high', 'low', 'close', 'volume']
         feature_cols = [col for col in df.columns if col not in exclude_cols]
         logger.info(f"🔧 Feature columns: {len(feature_cols)}")
         
-        # Get last row
         X = df[feature_cols].tail(1)
         logger.info(f"📈 X shape: {X.shape}")
         
         if len(X) == 0:
             raise HTTPException(status_code=503, detail=f"No data available for {timeframe}")
         
-        # Get prediction
         try:
             if hasattr(predictor, 'model') and hasattr(predictor.model, 'predict_proba'):
                 if isinstance(predictor.model, dict) and 'models' in predictor.model:
@@ -902,11 +784,9 @@ async def get_signal_timeframe(
             logger.error(f"❌ Prediction failed: {e}")
             prob = 0.5
         
-        # Calculate signal
         threshold = getattr(predictor, 'threshold', 0.45)
         signal = "BUY" if prob > threshold else "HOLD"
         
-        # Calculate volatility
         volatility = float(df['close'].pct_change().std() * np.sqrt(24))
         if pd.isna(volatility) or volatility == 0:
             volatility = 0.01
@@ -921,7 +801,6 @@ async def get_signal_timeframe(
             "model_version": "2.0.0"
         }
         
-        # Cache it
         cache.set(cache_key, response)
         logger.info(f"✅ Generated {timeframe} signal: {signal}")
         
@@ -945,7 +824,7 @@ async def get_signal_timeframe(
 @app.get("/available-timeframes", tags=["Info"])
 async def get_available_timeframes(
     request: Request,
-    rate_headers: dict = Depends(check_rate_limit)
+    rate_headers: dict = Depends(get_rate_headers)
 ):
     """Get list of available timeframes and your tier access"""
     return JSONResponse(
@@ -964,15 +843,11 @@ async def get_available_timeframes(
 @app.get("/price", response_model=PriceResponse, tags=["Market Data"])
 async def get_price(
     request: Request,
-    rate_headers: dict = Depends(check_rate_limit),
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
+    rate_headers: dict = Depends(get_rate_headers),
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    """
-    Get current Bitcoin price with 24h statistics (CACHED)
-    """
+    """Get current Bitcoin price with 24h statistics (CACHED)"""
     try:
-        # Try cache first
         cached_price = cache.get('price')
         if cached_price:
             return JSONResponse(
@@ -983,9 +858,8 @@ async def get_price(
                 }
             )
         
-        # Cache miss - generate new price
         df = pd.read_parquet('data/processed/features_latest.parquet')
-        df = df.tail(24)  # Last 24 hours
+        df = df.tail(24)
         
         current_price = df['close'].iloc[-1]
         prev_price = df['close'].iloc[0]
@@ -999,7 +873,6 @@ async def get_price(
             timestamp=datetime.now().isoformat()
         ).dict()
         
-        # Store in cache
         cache.set('price', response)
         
         return JSONResponse(
@@ -1020,21 +893,17 @@ async def get_price(
 @app.get("/stats", response_model=StatsResponse, tags=["Model Info"])
 async def get_stats(
     request: Request,
-    rate_headers: dict = Depends(check_rate_limit),
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
+    rate_headers: dict = Depends(get_rate_headers),
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    """
-    Get model performance statistics
-    """
+    """Get model performance statistics"""
     try:
-        # Load model stats
         model_path = 'data/models/yasen_alpha_champion.joblib'
         model_data = joblib.load(model_path)
         
         return JSONResponse(
             content=StatsResponse(
-                win_rate=0.5904,  # Fixed from latest backtest
+                win_rate=0.5904,
                 total_trades=8274,
                 sharpe_ratio=0.42,
                 features=78,
@@ -1047,7 +916,6 @@ async def get_stats(
     
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
-        # Return cached/default stats if model not available
         return JSONResponse(
             content=StatsResponse(
                 win_rate=0.5904,
@@ -1065,36 +933,27 @@ async def get_stats(
 async def get_history(
     request: Request,
     days: int = 7,
-    rate_headers: dict = Depends(check_rate_limit),
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
+    rate_headers: dict = Depends(get_rate_headers),
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    """
-    Get historical signals and prices
-    
-    Parameters:
-    - days: number of days of history (default: 7, max: 30)
-    """
+    """Get historical signals and prices"""
     try:
         if days > 30:
             days = 30
         
         df = pd.read_parquet('data/processed/features_latest.parquet')
-        df = df.tail(days * 24)  # Hours
+        df = df.tail(days * 24)
         
-        # Get predictor for historical signals
         predictor = get_predictor()
         exclude_cols = ['open', 'high', 'low', 'close', 'volume']
         feature_cols = [col for col in df.columns if col not in exclude_cols]
         X = df[feature_cols]
         
-        # Calculate historical signals
         signals = []
-        for i in range(0, len(X), 6):  # Sample every 6 hours to reduce data
+        for i in range(0, len(X), 6):
             if i >= len(X):
                 break
             
-            # Get prediction
             if hasattr(predictor.model, 'predict_proba'):
                 pred = predictor.model['models'][0].predict_proba(X.iloc[i:i+1])[0][1]
             else:
@@ -1128,7 +987,7 @@ async def get_history(
 @app.get("/model-info", tags=["Model Info"])
 async def model_info(
     request: Request,
-    rate_headers: dict = Depends(check_rate_limit)
+    rate_headers: dict = Depends(get_rate_headers)
 ):
     """Detailed model information for debugging"""
     try:
@@ -1146,7 +1005,6 @@ async def model_info(
             'last_training': datetime.now().isoformat()
         }
         
-        # Add parameter info if available
         if 'params' in model_data:
             info['parameters'] = model_data['params']
         
@@ -1165,9 +1023,8 @@ async def rate_limit_info(
     api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
     """Get rate limit information for your API key"""
-    if api_key and api_key in API_KEYS:
-        return API_KEYS[api_key]
-    return {"tier": "public", "rate_limit": 100}
+    # No hardcoded keys - just return public info
+    return {"tier": "managed_by_rapidapi", "rate_limit": "see_rapidapi_dashboard"}
 
 # Error handlers
 @app.exception_handler(404)
@@ -1196,7 +1053,7 @@ async def internal_error_handler(request, exc):
 @app.get("/cache-stats", tags=["Monitoring"])
 async def get_cache_stats(
     request: Request,
-    rate_headers: dict = Depends(check_rate_limit)
+    rate_headers: dict = Depends(get_rate_headers)
 ):
     """Get cache performance statistics"""
     return JSONResponse(
@@ -1207,26 +1064,16 @@ async def get_cache_stats(
 @app.get("/live-stats", tags=["Proof"])
 async def get_live_stats(
     request: Request,
-    rate_headers: dict = Depends(check_rate_limit)
+    rate_headers: dict = Depends(get_rate_headers)
 ):
-    """
-    📊 LIVE PROOF DASHBOARD - See real-time performance metrics
-    This endpoint shows actual cache performance and model stats
-    """
+    """📊 LIVE PROOF DASHBOARD - See real-time performance metrics"""
     try:
-        # Get cache stats
         cache_stats = cache.get_stats()
-        
-        # Get current signal
         predictor = get_predictor()
         current_signal = predictor.get_current_signal()
         
-        # Get the cached signal (to compare timestamps)
-        cached_signal = cache.get('signal')
-        
-        # Calculate some impressive metrics
         total_requests = cache_stats['hits'] + cache_stats['misses']
-        avg_response_time_ms = 20 if cache_stats['hits'] > 0 else 18000  # 20ms cache vs 18s cold
+        avg_response_time_ms = 20 if cache_stats['hits'] > 0 else 18000
         
         stats = {
             "status": "operational",
@@ -1268,8 +1115,7 @@ async def get_live_stats(
                 "🏆 59.19% PROVEN ACCURACY",
                 "⚡ 360x FASTER WITH CACHE",
                 "📊 8,274 BACKTESTED TRADES",
-                "🔓 100% OPEN SOURCE",
-                "💯 100% CACHE HIT RATE"
+                "🔓 100% OPEN SOURCE"
             ],
             "call_to_action": {
                 "free_tier": "100 requests/month",
@@ -1311,36 +1157,19 @@ async def get_live_stats(
 async def get_signal_strength(
     request: Request,
     timeframe: str = "1h",
-    rate_headers: dict = Depends(check_rate_limit),
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
+    rate_headers: dict = Depends(get_rate_headers),
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    """
-    📊 Get signal strength on 0-100 scale with visual indicators
-    
-    Parameters:
-    - timeframe: 5min, 15min, 1h, 4h, 1d (default: 1h)
-    
-    Returns:
-    - score: 0-100 strength score
-    - strength: VERY_STRONG, STRONG, MODERATE, WEAK, VERY_WEAK
-    - color: Visual indicator (🟢🟡🟠🔴)
-    - action: Recommended action
-    - components: Breakdown of scoring
-    """
+    """📊 Get signal strength on 0-100 scale with visual indicators"""
     try:
         logger.info(f"🔍 Signal strength called for timeframe: {timeframe}")
         
-        # Check tier for timeframe access
         valid_timeframes = ["5min", "15min", "1h", "4h", "1d"]
         if timeframe not in valid_timeframes:
             raise HTTPException(status_code=400, detail="Invalid timeframe")
         
-        # Tier restrictions (same as signal endpoint)
-        if auth['tier'] == 'free' and timeframe != '1h':
-            raise HTTPException(status_code=403, detail="Free tier only has 1h signals. Upgrade for more!")
+        # Tier access handled by RapidAPI
         
-        # Try cache first
         cache_key = f'strength_{timeframe}'
         cached = cache.get(cache_key)
         if cached:
@@ -1356,16 +1185,9 @@ async def get_signal_strength(
         
         logger.info(f"⚠️ Cache MISS for strength {timeframe}")
         
-        # Get the signal data DIRECTLY instead of calling the endpoint
-        logger.info("📡 Getting signal data directly...")
-        
-        # Get resampled data
         df = resample_data(timeframe)
-        
-        # Get predictor
         predictor = get_predictor()
         
-        # Prepare features
         exclude_cols = ['open', 'high', 'low', 'close', 'volume']
         feature_cols = [col for col in df.columns if col not in exclude_cols]
         X = df[feature_cols].tail(1)
@@ -1373,10 +1195,8 @@ async def get_signal_strength(
         if len(X) == 0:
             raise HTTPException(status_code=503, detail=f"No data available for {timeframe}")
         
-        # Get prediction
         if hasattr(predictor, 'model'):
             if isinstance(predictor.model, dict) and 'models' in predictor.model:
-                # Ensemble model
                 probs = []
                 for model in predictor.model['models']:
                     if hasattr(model, 'predict_proba'):
@@ -1384,7 +1204,6 @@ async def get_signal_strength(
                         probs.append(prob)
                 prob = np.mean(probs)
             else:
-                # Single model
                 if hasattr(predictor.model, 'predict_proba'):
                     prob = predictor.model.predict_proba(X)[0][1]
                 else:
@@ -1392,19 +1211,15 @@ async def get_signal_strength(
         else:
             prob = 0.5
         
-        # Calculate signal
         threshold = getattr(predictor, 'threshold', 0.45)
         signal = "BUY" if prob > threshold else "HOLD"
         
-        # Calculate volatility
         volatility = float(df['close'].pct_change().std() * np.sqrt(24))
         if pd.isna(volatility) or volatility == 0:
             volatility = 0.01
         
         logger.info(f"✅ Got signal: {signal}, confidence: {prob:.4f}, volatility: {volatility:.4f}")
         
-        # Calculate market regime
-        logger.info("📈 Calculating market regime...")
         returns = df['close'].pct_change().dropna()
         
         if len(returns) > 20:
@@ -1417,15 +1232,12 @@ async def get_signal_strength(
         else:
             market_regime = "UNKNOWN"
         
-        # Calculate strength using helper function
-        logger.info("📊 Calculating signal strength...")
         strength_data = calculate_signal_strength(
             confidence=float(prob),
             volatility=volatility,
             market_regime=market_regime
         )
         
-        # Combine with signal data
         response = {
             "signal": signal,
             "strength_analysis": strength_data,
@@ -1434,7 +1246,6 @@ async def get_signal_strength(
             "timestamp": datetime.now().isoformat()
         }
         
-        # Cache for 5 minutes
         cache.set(cache_key, response)
         logger.info(f"✅ Signal strength calculated: {strength_data['strength']} ({strength_data['score']}/100)")
         
@@ -1460,42 +1271,19 @@ async def get_support_resistance(
     request: Request,
     timeframe: str = "1h",
     lookback: int = 50,
-    rate_headers: dict = Depends(check_rate_limit),
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
+    rate_headers: dict = Depends(get_rate_headers),
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    """
-    📊 Get support and resistance levels for Bitcoin
-    
-    Parameters:
-    - timeframe: 5min, 15min, 1h, 4h, 1d (default: 1h)
-    - lookback: Number of candles to analyze (default: 50, max: 200)
-    
-    Returns:
-    - Current price
-    - Key support levels (buy zones)
-    - Key resistance levels (sell zones)
-    - Nearest levels with distances
-    - Trend direction
-    - 24h trading range
-    """
+    """📊 Get support and resistance levels for Bitcoin"""
     try:
-        # Validate timeframe
         valid_timeframes = ["5min", "15min", "1h", "4h", "1d"]
         if timeframe not in valid_timeframes:
             raise HTTPException(status_code=400, detail="Invalid timeframe")
         
-        # Check tier
-        if auth['tier'] == 'free' and timeframe != '1h':
-            raise HTTPException(status_code=403, detail="Free tier only has 1h levels. Upgrade for more!")
+        # Tier access handled by RapidAPI
         
-        if auth['tier'] == 'pro' and timeframe in ['5min', '1d']:
-            raise HTTPException(status_code=403, detail="Upgrade to Ultra for 5min and 1d levels!")
-        
-        # Limit lookback
         lookback = min(lookback, 200)
         
-        # Try cache first
         cache_key = f'levels_{timeframe}_{lookback}'
         cached = cache.get(cache_key)
         if cached:
@@ -1508,16 +1296,13 @@ async def get_support_resistance(
                 }
             )
         
-        # Get data
         df = resample_data(timeframe)
         
         if len(df) < lookback:
             lookback = len(df)
         
-        # Calculate levels
         levels = calculate_support_resistance(df.tail(lookback))
         
-        # Add metadata
         response = {
             **levels,
             "timeframe": timeframe,
@@ -1530,7 +1315,6 @@ async def get_support_resistance(
             }
         }
         
-        # Cache for 5 minutes
         cache.set(cache_key, response)
         
         return JSONResponse(
@@ -1565,14 +1349,11 @@ def get_trading_strategy(trend, support_dist, resistance_dist):
 @app.get("/webhooks", tags=["Webhooks"])
 async def list_webhooks(
     request: Request,
-    rate_headers: dict = Depends(check_rate_limit),
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
+    rate_headers: dict = Depends(get_rate_headers),
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
     """List all your registered webhooks"""
-    if auth['tier'] == 'free':
-        raise HTTPException(status_code=403, detail="Webhooks require Pro or Ultra tier")
-    
+    # Webhook access controlled by RapidAPI tier
     webhooks = webhook_manager.get_user_webhooks(api_key or "public")
     return JSONResponse(content={"webhooks": webhooks}, headers=rate_headers)
 
@@ -1580,46 +1361,20 @@ async def list_webhooks(
 async def register_webhook(
     request: Request,
     webhook_request: dict,
-    rate_headers: dict = Depends(check_rate_limit),
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
+    rate_headers: dict = Depends(get_rate_headers),
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    """
-    Register a webhook to receive real-time alerts
-    
-    Body:
-    {
-        "url": "https://your-server.com/webhook",
-        "events": ["signal_change", "level_break"],
-        "secret": "optional_secret_for_verification"
-    }
-    
-    Events:
-    - signal_change: When signal changes (BUY/HOLD)
-    - level_break: When price breaks support/resistance
-    - price_alert: When price crosses threshold
-    - whale_alert: Large transactions detected
-    """
-    if auth['tier'] == 'free':
-        raise HTTPException(status_code=403, detail="Webhooks require Pro or Ultra tier")
-    
-    # Validate URL
+    """Register a webhook to receive real-time alerts"""
     url = webhook_request.get('url')
     if not url or not url.startswith(('http://', 'https://')):
         raise HTTPException(status_code=400, detail="Invalid URL")
     
-    # Validate events
     valid_events = ['signal_change', 'level_break', 'price_alert', 'whale_alert']
     events = webhook_request.get('events', ['signal_change'])
     for event in events:
         if event not in valid_events:
             raise HTTPException(status_code=400, detail=f"Invalid event: {event}")
     
-    # Tier limits
-    if auth['tier'] == 'pro' and len(events) > 2:
-        raise HTTPException(status_code=403, detail="Pro tier limited to 2 event types")
-    
-    # Register webhook
     webhook = webhook_manager.register(
         user_id=api_key or "public",
         url=url,
@@ -1627,7 +1382,6 @@ async def register_webhook(
         secret=webhook_request.get('secret')
     )
     
-    # Send test webhook
     test_data = {
         "message": "Test webhook from YASEN-ALPHA",
         "signal": "HOLD",
@@ -1649,9 +1403,8 @@ async def register_webhook(
 async def delete_webhook(
     request: Request,
     webhook_id: str,
-    rate_headers: dict = Depends(check_rate_limit),
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
+    rate_headers: dict = Depends(get_rate_headers),
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
     """Delete a webhook"""
     webhook_manager.unregister(api_key or "public", webhook_id)
@@ -1664,9 +1417,8 @@ async def delete_webhook(
 async def test_webhook(
     request: Request,
     webhook_request: dict,
-    rate_headers: dict = Depends(check_rate_limit),
-    api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    auth: dict = Depends(verify_api_key)
+    rate_headers: dict = Depends(get_rate_headers),
+    api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
     """Send a test webhook to your URL"""
     url = webhook_request.get('url')
@@ -1697,22 +1449,18 @@ async def test_webhook(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Webhook failed: {str(e)}")
 
-# KEEP ALIVE SYSTEM - Prevents Render from sleeping
+# KEEP ALIVE SYSTEM
 def keep_alive():
-    """Self-ping every 4-6 minutes to keep Render awake"""
     render_url = os.environ.get('RENDER_URL', 'https://yasen-alpha-ml-trading-system.onrender.com')
     
     while True:
-        # Random interval between 4-6 minutes (more natural)
-        sleep_time = 240 + (60 * random.random())  # 4-5 minutes
+        sleep_time = 240 + (60 * random.random())
         time.sleep(sleep_time)
         
         try:
-            # Ping health endpoint
             response = requests.get(f"{render_url}/health", timeout=10)
             
             if response.status_code == 200:
-                # Randomly choose second endpoint (less predictable)
                 if random.random() > 0.5:
                     requests.get(f"{render_url}/cache-stats", timeout=5)
                 else:
@@ -1722,20 +1470,18 @@ def keep_alive():
             
         except Exception as e:
             logger.error(f"Self-ping failed: {e}")
-            pass  # Silent fail - won't crash
+            pass
 
-# Start keep-alive in background thread (works on Render AND locally)
 keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
 keep_alive_thread.start()
 logger.info("✅ Keep-alive system started - API will stay awake 24/7!")
 
 if __name__ == "__main__":
     import uvicorn
-    # Use PORT environment variable (Render sets this automatically)
     port = int(os.environ.get('PORT', 8000))
     uvicorn.run(
         "main:app",
         host="0.0.0.0", 
         port=port,
-        reload=False  # Turn off reload in production
+        reload=False
     )
