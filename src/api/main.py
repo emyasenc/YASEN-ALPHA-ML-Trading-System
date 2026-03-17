@@ -201,7 +201,7 @@ app = FastAPI(
 )
 
 # Force garbage collection periodically
-@app.middleware("http")
+''' @app.middleware("http")
 async def add_memory_management(request: Request, call_next):
     """Monitor and manage memory usage"""
     response = await call_next(request)
@@ -210,8 +210,8 @@ async def add_memory_management(request: Request, call_next):
         gc.collect()
         logger.info(f"🧹 Garbage collected. Memory: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
     
-    return response
-
+    return response '''
+    
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
