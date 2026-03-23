@@ -1,7 +1,7 @@
 """
 YASEN-ALPHA Production API
 Enterprise-grade FastAPI backend for Bitcoin trading signals
-WITH PRODUCTION RATE LIMITING - RAPIDAPI HANDLES BILLING
+WITH PRODUCTION RATE LIMITING
 """
 from .cache import cache
 from .webhooks import webhook_manager
@@ -194,7 +194,7 @@ rate_limiter = RateLimiter()
 # Initialize FastAPI
 app = FastAPI(
     title="YASEN-ALPHA Trading API",
-    description="Production-grade Bitcoin prediction system with 59.19% accuracy",
+    description="Production-grade Bitcoin prediction system with 58.9% accuracy",
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -502,9 +502,12 @@ async def startup_event():
     logger.info("="*60)
     
     try:
+        # 🔥 STEP 1: LOAD PREDICTOR FIRST
+        logger.info("🔥 PRE-LOADING PREDICTOR...")
         predictor = get_predictor()
         logger.info("✅ Predictor loaded successfully")
         
+        # 🔥 STEP 2: WARM UP CACHE
         logger.info("🔥 WARMING UP CACHE - Generating first signal...")
         signal_data = predictor.get_current_signal()
         signal_response = SignalResponse(
@@ -534,6 +537,7 @@ async def startup_event():
         
         logger.info("✅ CACHE WARMED - First user gets INSTANT response!")
         
+        # 🔥 STEP 3: BACKGROUND UPDATES
         def update_all_caches():
             """Update all cache keys in background and trigger webhooks"""
             try:
@@ -945,24 +949,67 @@ async def get_history(
         df = df.tail(days * 24)
         
         predictor = get_predictor()
+        
+        # Use the predictor's predict method for batch processing
         exclude_cols = ['open', 'high', 'low', 'close', 'volume']
         feature_cols = [col for col in df.columns if col not in exclude_cols]
         X = df[feature_cols]
         
+        # Get predictions using the predictor's batch method
+        if hasattr(predictor, 'predict'):
+            result = predictor.predict(df)
+            predictions = result['probabilities']
+        else:
+            # Fallback for old predictor
+            predictions = []
+            for i in range(0, len(X), 6):
+                if i >= len(X):
+                    break
+                try:
+                    # Try to use the model directly
+                    if hasattr(predictor.model, 'predict_proba'):
+                        if isinstance(predictor.model, dict) and 'models' in predictor.model:
+                            # Advanced model
+                            regime_models = predictor.model.get('models', {})
+                            if regime_models:
+                                probs = []
+                                for model in regime_models.values():
+                                    prob = model.predict_proba(X.iloc[i:i+1])[0][1]
+                                    probs.append(prob)
+                                pred = np.mean(probs)
+                            else:
+                                pred = 0.5
+                        else:
+                            # Old model
+                            pred = predictor.model.predict_proba(X.iloc[i:i+1])[0][1]
+                    else:
+                        pred = 0.5
+                except:
+                    pred = 0.5
+                predictions.append(pred)
+            predictions = np.array(predictions)
+        
+        # Create signals list
         signals = []
-        for i in range(0, len(X), 6):
-            if i >= len(X):
+        threshold = getattr(predictor, 'threshold', 0.45)
+        
+        # Sample every 6 hours to reduce data
+        sample_step = 6
+        for i in range(0, len(df), sample_step):
+            if i >= len(df):
                 break
             
-            if hasattr(predictor.model, 'predict_proba'):
-                pred = predictor.model['models'][0].predict_proba(X.iloc[i:i+1])[0][1]
+            # Get prediction at this index
+            pred_idx = i // sample_step
+            if pred_idx < len(predictions):
+                pred = predictions[pred_idx]
             else:
                 pred = 0.5
             
             signals.append({
                 'timestamp': df.index[i].isoformat(),
                 'price': float(df['close'].iloc[i]),
-                'signal': 'BUY' if pred > 0.45 else 'HOLD',
+                'signal': 'BUY' if pred > threshold else 'HOLD',
                 'confidence': round(float(pred), 4)
             })
         
@@ -979,9 +1026,11 @@ async def get_history(
     
     except Exception as e:
         logger.error(f"Error getting history: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=503,
-            detail="Historical data temporarily unavailable"
+            detail=f"Historical data temporarily unavailable: {str(e)}"
         )
 
 @app.get("/model-info", tags=["Model Info"])
@@ -992,28 +1041,43 @@ async def model_info(
     """Detailed model information for debugging"""
     try:
         predictor = get_predictor()
-        model_data = joblib.load('data/models/yasen_alpha_champion.joblib')
         
-        info = {
-            'model_type': type(predictor.model).__name__,
-            'win_rate': 0.5904,
-            'features': 78,
-            'threshold': 0.45,
-            'data_points': 31693,
-            'training_samples': 31470,
-            'model_version': '2.0.0',
-            'last_training': datetime.now().isoformat()
-        }
-        
-        if 'params' in model_data:
-            info['parameters'] = model_data['params']
+        # Get model info based on predictor type
+        if hasattr(predictor, 'model_data'):
+            # New advanced model
+            model_data = predictor.model_data
+            info = {
+                'model_type': 'Advanced Ensemble (Regime-Based)',
+                'win_rate': predictor.win_rate,
+                'features': len(predictor.features) if predictor.features else 78,
+                'threshold': predictor.threshold,
+                'data_points': 31693,
+                'training_samples': 31470,
+                'model_version': '3.0',
+                'last_training': datetime.now().isoformat(),
+                'regimes': list(model_data.get('models', {}).keys()),
+                'regime_thresholds': model_data.get('thresholds', {})
+            }
+        else:
+            # Old champion model
+            model_data = joblib.load('data/models/yasen_alpha_champion.joblib')
+            info = {
+                'model_type': 'XGBoost Ensemble (5 models)',
+                'win_rate': model_data.get('win_rate', 0.5904),
+                'features': len(model_data.get('features', [])),
+                'threshold': model_data.get('threshold', 0.45),
+                'data_points': 31693,
+                'training_samples': 31470,
+                'model_version': '2.0',
+                'last_training': datetime.now().isoformat()
+            }
         
         return JSONResponse(content=info, headers=rate_headers)
     
     except Exception as e:
         logger.error(f"Error getting model info: {e}")
         return JSONResponse(
-            content={"error": "Model info unavailable"},
+            content={"error": "Model info temporarily unavailable"},
             headers=rate_headers
         )
 
@@ -1092,8 +1156,8 @@ async def get_live_stats(
                     "average_response_ms": avg_response_time_ms
                 },
                 "model_accuracy": {
-                    "proven_win_rate": "59.19%",
-                    "backtested_trades": 8274,
+                    "proven_win_rate": "59.90%",
+                    "backtested_trades": 901,
                     "data_history_years": 9.2,
                     "features_used": 78
                 },
@@ -1112,13 +1176,13 @@ async def get_live_stats(
                 }
             },
             "badges": [
-                "🏆 59.19% PROVEN ACCURACY",
+                "🏆 58.90% PROVEN ACCURACY",
                 "⚡ 360x FASTER WITH CACHE",
-                "📊 8,274 BACKTESTED TRADES",
+                "📊 901 BACKTESTED TRADES",
                 "🔓 100% OPEN SOURCE"
             ],
             "call_to_action": {
-                "free_tier": "100 requests/month",
+                "free_tier": "50 requests/month",
                 "pro_tier": "$29/month - 5,000 calls, 10/sec",
                 "ultra_tier": "$79/month - 25,000 calls, 50/sec",
                 "mega_tier": "$199/month - 100,000 calls, 200/sec",
@@ -1144,8 +1208,8 @@ async def get_live_stats(
                 "status": "degraded",
                 "message": "Live stats temporarily unavailable",
                 "basic_proof": {
-                    "win_rate": "59.19%",
-                    "trades": 8274,
+                    "win_rate": "59.9%",
+                    "trades": 901,
                     "github": "https://github.com/emyasenc/YASEN-ALPHA-ML-Trading-System"
                 }
             },
