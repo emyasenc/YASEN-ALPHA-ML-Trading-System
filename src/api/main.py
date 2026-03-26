@@ -1,7 +1,7 @@
 """
 YASEN-ALPHA Production API
 Enterprise-grade FastAPI backend for Bitcoin trading signals
-WITH PRODUCTION RATE LIMITING
+WITH ACTUAL RATE LIMITING ENFORCEMENT
 """
 from .cache import cache
 from .webhooks import webhook_manager
@@ -41,144 +41,97 @@ sys.path.append(str(Path(__file__).parent.parent.parent))
 from src.models.inference.predictor import YasenAlphaPredictor
 
 # ============================================================================
-# PRODUCTION RATE LIMITING SYSTEM - PSYCHOLOGICAL ONLY
+# ACTUAL RATE LIMITING SYSTEM - ENFORCES BLOCKING
 # ============================================================================
 
 class RateLimiter:
     """
-    Psychological rate limiting system
-    Headers only - actual billing handled by RapidAPI
+    ACTUAL rate limiting system - blocks excessive requests
     """
     
     def __init__(self):
-        # Store: {identifier: {month: request_count}}
-        self.usage = defaultdict(lambda: defaultdict(int))
-        self.per_second_usage = defaultdict(lambda: defaultdict(list))
+        # Store request timestamps per identifier
+        self.requests = defaultdict(list)  # {identifier: [timestamps]}
         self.lock = threading.Lock()
         
-        # Rate limits per tier (for HEADERS only - not enforced)
+        # Rate limits per tier (REQUESTS PER MINUTE)
         self.tier_limits = {
-            "public": 100,      # Basic tier - 100/month
-            "free": 100,        # Free RapidAPI tier
-            "pro": 5000,        # Pro tier - 5,000/month
-            "ultra": 25000,     # Ultra tier - 25,000/month
-            "mega": 100000      # MEGA tier - 100,000/month
-        }
-        
-        # Per-second rate limits (for HEADERS only - not enforced)
-        self.tier_rps = {
-            "public": 1,        # 1 req/sec
-            "free": 1,          # 1 req/sec
-            "pro": 10,          # 10 req/sec
-            "ultra": 50,        # 50 req/sec
-            "mega": 200         # 200 req/sec
+            "free": 10,       # 10 requests per minute
+            "pro": 50,        # 50 requests per minute
+            "ultra": 200,     # 200 requests per minute
+            "mega": 500       # 500 requests per minute
         }
         
         # Start cleanup thread
         self._start_cleanup()
-        logger.info("✅ Psychological rate limiter initialized")
+        logger.info("✅ ACTUAL rate limiter initialized")
     
     def _get_identifier(self, request: Request, api_key: Optional[str]) -> str:
-        """Get unique identifier for rate limiting (IP only - keys handled by RapidAPI)"""
-        client_ip = request.client.host if request.client else "unknown"
-        # We don't hash API keys anymore - RapidAPI handles that
-        return f"ip_{client_ip}"
+        """Get unique identifier for rate limiting"""
+        # Use API key if provided, otherwise fall back to IP
+        if api_key:
+            return f"key_{api_key[:8]}"
+        return f"ip_{request.client.host if request.client else 'unknown'}"
     
-    def _get_month(self) -> str:
-        """Get current month as string (for monthly quotas)"""
-        return datetime.now().strftime("%Y-%m")
-    
-    def _check_per_second(self, identifier: str, tier: str, current_time: float) -> bool:
-        """Check per-second rate limit - purely for headers"""
-        rps_limit = self.tier_rps.get(tier, 1)
-        
-        # Clean old requests (older than 1 second)
-        self.per_second_usage[identifier][tier] = [
-            t for t in self.per_second_usage[identifier].get(tier, [])
-            if current_time - t < 1.0
-        ]
-        
-        # Always return True - we don't enforce, just track
-        if tier not in self.per_second_usage[identifier]:
-            self.per_second_usage[identifier][tier] = []
-        self.per_second_usage[identifier][tier].append(current_time)
-        return True
-    
-    def _seconds_until_month_end(self) -> int:
-        """Calculate seconds until end of current month"""
-        now = datetime.now()
-        if now.month == 12:
-            next_month = datetime(now.year + 1, 1, 1)
-        else:
-            next_month = datetime(now.year, now.month + 1, 1)
-        return int((next_month - now).total_seconds())
-    
-    def get_headers(self, request: Request, api_key: Optional[str], tier: str) -> Dict:
+    def check_rate_limit(self, identifier: str, tier: str) -> Tuple[bool, Dict]:
         """
-        Generate rate limit headers (does NOT enforce)
+        Check if request is allowed
+        Returns (is_allowed, headers_info)
         """
-        identifier = self._get_identifier(request, api_key)
-        current_month = self._get_month()
-        current_time = time.time()
-        
-        monthly_limit = self.tier_limits.get(tier, 100)
-        rps_limit = self.tier_rps.get(tier, 1)
+        now = time.time()
+        window = 60  # 1 minute window
+        limit = self.tier_limits.get(tier, 10)
         
         with self.lock:
-            # Track per-second (for headers only)
-            self._check_per_second(identifier, tier, current_time)
+            # Clean old requests
+            self.requests[identifier] = [
+                t for t in self.requests[identifier] 
+                if now - t < window
+            ]
             
-            # Get current monthly count
-            current_monthly = self.usage[identifier][current_month]
+            current_count = len(self.requests[identifier])
             
-            # Calculate remaining
-            remaining = max(0, monthly_limit - current_monthly)
+            # Check limit
+            if current_count >= limit:
+                # Rate limit exceeded
+                retry_after = int(window - (now - self.requests[identifier][0]))
+                headers = {
+                    "X-RateLimit-Limit": str(limit),
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": str(int(window - (now - self.requests[identifier][0]))),
+                    "Retry-After": str(max(1, retry_after))
+                }
+                return False, headers
+            
+            # Add current request
+            self.requests[identifier].append(now)
             
             # Prepare headers
+            remaining = limit - current_count - 1
             headers = {
-                "X-RateLimit-Limit": str(monthly_limit),
+                "X-RateLimit-Limit": str(limit),
                 "X-RateLimit-Remaining": str(remaining),
-                "X-RateLimit-Reset": str(self._seconds_until_month_end()),
-                "X-RateLimit-Tier": tier,
-                "X-RateLimit-PerSecond": str(rps_limit)
+                "X-RateLimit-Reset": str(int(window - (now - self.requests[identifier][0])))
             }
-            
-            # Increment count for next time
-            self.usage[identifier][current_month] = current_monthly + 1
-            return headers
+            return True, headers
     
     def _start_cleanup(self):
-        """Start background thread to clean old data"""
+        """Clean old entries periodically"""
         def cleanup():
             while True:
-                time.sleep(3600)
-                try:
-                    current_month = self._get_month()
-                    with self.lock:
-                        to_delete = []
-                        for identifier in self.usage:
-                            for month in list(self.usage[identifier].keys()):
-                                if month < current_month:
-                                    del self.usage[identifier][month]
-                            if not self.usage[identifier]:
-                                to_delete.append(identifier)
-                        for identifier in to_delete:
-                            del self.usage[identifier]
-                        
-                        current_time = time.time()
-                        for identifier in list(self.per_second_usage.keys()):
-                            for tier in list(self.per_second_usage[identifier].keys()):
-                                self.per_second_usage[identifier][tier] = [
-                                    t for t in self.per_second_usage[identifier][tier]
-                                    if current_time - t < 1.0
-                                ]
-                                if not self.per_second_usage[identifier][tier]:
-                                    del self.per_second_usage[identifier][tier]
-                            if not self.per_second_usage[identifier]:
-                                del self.per_second_usage[identifier]
-                                
-                except Exception as e:
-                    logger.error(f"Rate limit cleanup error: {e}")
+                time.sleep(3600)  # Clean every hour
+                with self.lock:
+                    now = time.time()
+                    to_delete = []
+                    for identifier, timestamps in self.requests.items():
+                        # Keep only last hour of data
+                        self.requests[identifier] = [
+                            t for t in timestamps if now - t < 3600
+                        ]
+                        if not self.requests[identifier]:
+                            to_delete.append(identifier)
+                    for identifier in to_delete:
+                        del self.requests[identifier]
         
         thread = threading.Thread(target=cleanup, daemon=True)
         thread.start()
@@ -200,18 +153,59 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# Force garbage collection periodically
-''' @app.middleware("http")
-async def add_memory_management(request: Request, call_next):
-    """Monitor and manage memory usage"""
+# Rate limiting middleware - ENFORCES limits
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Enforce rate limits on all requests"""
+    
+    # Skip rate limiting for health check and root endpoints (optional)
+    skip_paths = ["/health", "/", "/docs", "/redoc", "/openapi.json"]
+    if request.url.path in skip_paths:
+        return await call_next(request)
+    
+    # Get API key from headers
+    api_key = request.headers.get("X-API-Key")
+    
+    # Determine tier (from RapidAPI or default)
+    tier_header = request.headers.get("X-RapidAPI-User-Tier", "free")
+    
+    # Map RapidAPI tiers to our internal tiers
+    tier_map = {
+        "free": "free",
+        "pro": "pro",
+        "ultra": "ultra",
+        "mega": "mega"
+    }
+    tier = tier_map.get(tier_header.lower(), "free")
+    
+    # Get identifier
+    identifier = rate_limiter._get_identifier(request, api_key)
+    
+    # Check rate limit
+    allowed, rate_headers = rate_limiter.check_rate_limit(identifier, tier)
+    
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "Rate limit exceeded",
+                "code": 429,
+                "message": f"Too many requests. Limit: {rate_limiter.tier_limits.get(tier, 10)} requests per minute.",
+                "retry_after": int(rate_headers.get("Retry-After", 60)),
+                "timestamp": datetime.now().isoformat()
+            },
+            headers=rate_headers
+        )
+    
+    # Process request
     response = await call_next(request)
     
-    if random.randint(1, 100) == 1:
-        gc.collect()
-        logger.info(f"🧹 Garbage collected. Memory: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
+    # Add rate limit headers to response
+    for key, value in rate_headers.items():
+        response.headers[key] = str(value)
     
-    return response '''
-    
+    return response
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -263,39 +257,25 @@ def verify_api_key(x_api_key: Optional[str] = Header(None)):
     No hardcoded keys = no loopholes
     """
     if x_api_key is None:
-        # No key = public tier
-        return {"tier": "public"}
+        return {"tier": "free"}
     
     # ANY key that reaches here came through RapidAPI
     # RapidAPI has already validated the subscription
-    # We just need to determine which tier based on the request
-    # This info can come from RapidAPI headers
-    
-    # For now, we'll assume Pro tier for any key
-    # In production, you'd parse RapidAPI headers to get actual tier
     return {"tier": "pro"}
 
-# Optional: Parse RapidAPI headers for accurate tier
-def get_tier_from_headers(request: Request) -> str:
-    """
-    Extract tier from RapidAPI headers if available
-    """
-    # RapidAPI sends these headers
-    # You'd need to configure this in your RapidAPI dashboard
-    tier_header = request.headers.get("X-RapidAPI-User-Tier")
-    if tier_header:
-        return tier_header.lower()
-    return "public"
-
-# Rate limiting dependency (now just generates headers)
+# Rate limit headers generator (for responses)
 async def get_rate_headers(
     request: Request,
     api_key: Optional[str] = Header(None, alias="X-API-Key"),
     auth: dict = Depends(verify_api_key)
 ):
-    """Generate rate limit headers (no enforcement)"""
-    headers = rate_limiter.get_headers(request, api_key, auth['tier'])
-    return headers
+    """Generate rate limit headers for response"""
+    # Note: Actual enforcement happens in middleware
+    # This is just for header consistency
+    identifier = rate_limiter._get_identifier(request, api_key)
+    tier = auth['tier']
+    # Just return the tier info
+    return {"X-RateLimit-Tier": tier}
 
 # ============================================================================
 # END SECURITY FIX
