@@ -2,6 +2,7 @@
 YASEN-ALPHA Production API
 Enterprise-grade FastAPI backend for Bitcoin trading signals
 WITH ACTUAL RATE LIMITING ENFORCEMENT
+OPTIMIZED: Preloaded data, removed keep-alive, faster latency
 """
 from .cache import cache
 from .webhooks import webhook_manager
@@ -283,6 +284,7 @@ async def get_rate_headers(
 
 # Load predictor (cached)
 _predictor = None
+_preloaded_data = {}  # Global cache for preloaded timeframe data
 
 def get_predictor():
     """Lazy load predictor with caching"""
@@ -299,15 +301,23 @@ def get_predictor():
             raise RuntimeError("Could not load prediction model")
     return _predictor
 
-# Helper function for Multiple Timeframes endpoint
-def resample_data(timeframe: str):
-    """
-    Resample data to different timeframes with better error handling
-    Supported: 5min, 15min, 1h, 4h, 1d
-    """
+# OPTIMIZED: Preloaded resampling function (uses cached data)
+def get_resampled_data(timeframe: str):
+    """Get preloaded resampled data - FAST (no disk I/O)"""
+    global _preloaded_data
+    df = _preloaded_data.get(timeframe)
+    if df is None:
+        # Fallback: load on demand
+        logger.warning(f"⚠️ {timeframe} not preloaded, loading on demand")
+        df = resample_data_on_demand(timeframe)
+        _preloaded_data[timeframe] = df
+    return df
+
+# Fallback for on-demand resampling (if preload fails)
+def resample_data_on_demand(timeframe: str):
+    """Original resampling function - only used if preload fails"""
     try:
         df = pd.read_parquet('data/processed/features_latest.parquet')
-        logger.info(f"📊 Loaded data with shape: {df.shape}")
         
         timeframe_map = {
             "5min": "5T",
@@ -318,7 +328,6 @@ def resample_data(timeframe: str):
         }
         
         if timeframe not in timeframe_map:
-            logger.warning(f"⚠️ Timeframe {timeframe} not recognized, using original")
             return df
         
         offset = timeframe_map[timeframe]
@@ -328,8 +337,6 @@ def resample_data(timeframe: str):
         
         price_cols = ['open', 'high', 'low', 'close', 'volume']
         feature_cols = [col for col in df.columns if col not in price_cols]
-        
-        logger.info(f"💰 Price columns: {len(price_cols)}, 🔧 Feature columns: {len(feature_cols)}")
         
         df_price = df[price_cols].resample(offset).agg({
             'open': 'first',
@@ -343,7 +350,6 @@ def resample_data(timeframe: str):
         df_resampled = pd.concat([df_price, df_features], axis=1)
         df_resampled = df_resampled.fillna(method='ffill').fillna(method='bfill')
         
-        logger.info(f"✅ Resampled {timeframe}: {len(df_resampled)} rows")
         return df_resampled
         
     except Exception as e:
@@ -474,7 +480,9 @@ def calculate_support_resistance(df, window=20):
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize on startup with WARMUP - First request INSTANT!"""
+    """Initialize on startup with WARMUP - OPTIMIZED with preloaded data"""
+    global _preloaded_data
+    
     logger.info("="*60)
     logger.info("YASEN-ALPHA API Starting...")
     logger.info(f"Version: 2.0.0")
@@ -487,7 +495,56 @@ async def startup_event():
         predictor = get_predictor()
         logger.info("✅ Predictor loaded successfully")
         
-        # 🔥 STEP 2: WARM UP CACHE
+        # 🔥 STEP 2: PRELOAD ALL TIMEFRAME DATA (MAJOR LATENCY IMPROVEMENT)
+        logger.info("🔥 PRELOADING ALL TIMEFRAME DATA FOR FAST ACCESS...")
+        timeframes = ["5min", "15min", "1h", "4h", "1d"]
+        
+        # Load base data once
+        base_df = pd.read_parquet('data/processed/features_latest.parquet')
+        logger.info(f"📊 Base data loaded: {base_df.shape} rows")
+        
+        timeframe_map = {
+            "5min": "5T",
+            "15min": "15T",
+            "1h": "1H",
+            "4h": "4H",
+            "1d": "1D"
+        }
+        
+        price_cols = ['open', 'high', 'low', 'close', 'volume']
+        feature_cols = [col for col in base_df.columns if col not in price_cols]
+        
+        for tf in timeframes:
+            try:
+                offset = timeframe_map.get(tf, "1H")
+                
+                if tf == "1h":
+                    # 1h is already the base frequency, no resampling needed
+                    _preloaded_data[tf] = base_df.copy()
+                    logger.info(f"✅ Preloaded {tf}: {len(_preloaded_data[tf])} rows (base)")
+                else:
+                    # Resample
+                    df_price = base_df[price_cols].resample(offset).agg({
+                        'open': 'first',
+                        'high': 'max',
+                        'low': 'min',
+                        'close': 'last',
+                        'volume': 'sum'
+                    })
+                    
+                    df_features = base_df[feature_cols].resample(offset).last()
+                    df_resampled = pd.concat([df_price, df_features], axis=1)
+                    df_resampled = df_resampled.fillna(method='ffill').fillna(method='bfill')
+                    
+                    _preloaded_data[tf] = df_resampled
+                    logger.info(f"✅ Preloaded {tf}: {len(df_resampled)} rows")
+                    
+            except Exception as e:
+                logger.error(f"❌ Failed to preload {tf}: {e}")
+        
+        logger.info("✅ ALL TIMEFRAMES PRELOADED - Zero disk I/O on requests!")
+        
+        # 🔥 STEP 3: WARM UP CACHE
         logger.info("🔥 WARMING UP CACHE - Generating first signal...")
         signal_data = predictor.get_current_signal()
         signal_response = SignalResponse(
@@ -500,8 +557,7 @@ async def startup_event():
         cache.set('signal', signal_response)
         
         logger.info("💰 WARMING UP PRICE CACHE...")
-        df = pd.read_parquet('data/processed/features_latest.parquet')
-        df = df.tail(24)
+        df = _preloaded_data.get('1h', base_df).tail(24)
         current_price = df['close'].iloc[-1]
         prev_price = df['close'].iloc[0]
         
@@ -517,7 +573,7 @@ async def startup_event():
         
         logger.info("✅ CACHE WARMED - First user gets INSTANT response!")
         
-        # 🔥 STEP 3: BACKGROUND UPDATES
+        # 🔥 STEP 4: BACKGROUND UPDATES
         def update_all_caches():
             """Update all cache keys in background and trigger webhooks"""
             try:
@@ -534,8 +590,7 @@ async def startup_event():
                     timestamp=datetime.now().isoformat()
                 ).dict()
                 
-                df = pd.read_parquet('data/processed/features_latest.parquet')
-                df = df.tail(24)
+                df = _preloaded_data.get('1h', pd.read_parquet('data/processed/features_latest.parquet')).tail(24)
                 current_price = df['close'].iloc[-1]
                 prev_price = df['close'].iloc[0]
                 
@@ -611,6 +666,9 @@ async def startup_event():
         
         cache.start_background_updates(update_all_caches)
         logger.info("✅ Background cache updater started")
+        
+        # 🔥 STEP 5: REMOVED KEEP-ALIVE - Using Render Starter tier
+        logger.info("✅ Keep-alive disabled (Render Starter tier - no sleep)")
         
     except Exception as e:
         logger.error(f"❌ Failed to load predictor: {e}")
@@ -705,7 +763,7 @@ async def get_signal_timeframe(
     rate_headers: dict = Depends(get_rate_headers),
     api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    """Get Bitcoin trading signal for specific timeframe"""
+    """Get Bitcoin trading signal for specific timeframe - OPTIMIZED with preloaded data"""
     try:
         logger.info(f"🔍 TIMEFRAME REQUEST: {timeframe}")
         
@@ -731,21 +789,16 @@ async def get_signal_timeframe(
         
         logger.info(f"⚠️ Cache MISS for {timeframe} - generating...")
         
-        try:
-            df = resample_data(timeframe)
-            logger.info(f"📊 Resampled data shape: {df.shape}")
-        except Exception as e:
-            logger.error(f"❌ Resampling failed: {e}")
-            raise HTTPException(status_code=500, detail=f"Data resampling failed: {str(e)}")
+        # OPTIMIZED: Use preloaded data instead of reading from disk
+        df = get_resampled_data(timeframe)
+        logger.info(f"📊 Using preloaded data shape: {df.shape}")
         
         predictor = get_predictor()
         
         exclude_cols = ['open', 'high', 'low', 'close', 'volume']
         feature_cols = [col for col in df.columns if col not in exclude_cols]
-        logger.info(f"🔧 Feature columns: {len(feature_cols)}")
         
         X = df[feature_cols].tail(1)
-        logger.info(f"📈 X shape: {X.shape}")
         
         if len(X) == 0:
             raise HTTPException(status_code=503, detail=f"No data available for {timeframe}")
@@ -842,7 +895,10 @@ async def get_price(
                 }
             )
         
-        df = pd.read_parquet('data/processed/features_latest.parquet')
+        # OPTIMIZED: Use preloaded data
+        df = _preloaded_data.get('1h')
+        if df is None:
+            df = pd.read_parquet('data/processed/features_latest.parquet')
         df = df.tail(24)
         
         current_price = df['close'].iloc[-1]
@@ -925,7 +981,10 @@ async def get_history(
         if days > 30:
             days = 30
         
-        df = pd.read_parquet('data/processed/features_latest.parquet')
+        # OPTIMIZED: Use preloaded 1h data
+        df = _preloaded_data.get('1h')
+        if df is None:
+            df = pd.read_parquet('data/processed/features_latest.parquet')
         df = df.tail(days * 24)
         
         predictor = get_predictor()
@@ -1204,7 +1263,7 @@ async def get_signal_strength(
     rate_headers: dict = Depends(get_rate_headers),
     api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    """📊 Get signal strength on 0-100 scale with visual indicators"""
+    """📊 Get signal strength on 0-100 scale with visual indicators - OPTIMIZED"""
     try:
         logger.info(f"🔍 Signal strength called for timeframe: {timeframe}")
         
@@ -1229,7 +1288,8 @@ async def get_signal_strength(
         
         logger.info(f"⚠️ Cache MISS for strength {timeframe}")
         
-        df = resample_data(timeframe)
+        # OPTIMIZED: Use preloaded data
+        df = get_resampled_data(timeframe)
         predictor = get_predictor()
         
         exclude_cols = ['open', 'high', 'low', 'close', 'volume']
@@ -1318,7 +1378,7 @@ async def get_support_resistance(
     rate_headers: dict = Depends(get_rate_headers),
     api_key: Optional[str] = Header(None, alias="X-API-Key")
 ):
-    """📊 Get support and resistance levels for Bitcoin"""
+    """📊 Get support and resistance levels for Bitcoin - OPTIMIZED"""
     try:
         valid_timeframes = ["5min", "15min", "1h", "4h", "1d"]
         if timeframe not in valid_timeframes:
@@ -1340,7 +1400,8 @@ async def get_support_resistance(
                 }
             )
         
-        df = resample_data(timeframe)
+        # OPTIMIZED: Use preloaded data
+        df = get_resampled_data(timeframe)
         
         if len(df) < lookback:
             lookback = len(df)
@@ -1493,32 +1554,6 @@ async def test_webhook(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Webhook failed: {str(e)}")
 
-# KEEP ALIVE SYSTEM
-def keep_alive():
-    render_url = os.environ.get('RENDER_URL', 'https://yasen-alpha-ml-trading-system.onrender.com')
-    
-    while True:
-        sleep_time = 240 + (60 * random.random())
-        time.sleep(sleep_time)
-        
-        try:
-            response = requests.get(f"{render_url}/health", timeout=10)
-            
-            if response.status_code == 200:
-                if random.random() > 0.5:
-                    requests.get(f"{render_url}/cache-stats", timeout=5)
-                else:
-                    requests.get(f"{render_url}/live-stats", timeout=5)
-                    
-                logger.info(f"💤 Keep-alive ping successful (sleep: {sleep_time:.0f}s)")
-            
-        except Exception as e:
-            logger.error(f"Self-ping failed: {e}")
-            pass
-
-keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
-keep_alive_thread.start()
-logger.info("✅ Keep-alive system started - API will stay awake 24/7!")
 
 if __name__ == "__main__":
     import uvicorn
