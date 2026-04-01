@@ -28,6 +28,8 @@ from collections import defaultdict
 import hashlib
 import gc
 import psutil
+import httpx
+import asyncio
 
 # Configure logging
 logging.basicConfig(
@@ -611,6 +613,30 @@ async def startup_event():
         
         cache.start_background_updates(update_all_caches)
         logger.info("✅ Background cache updater started")
+        
+                        # 🔥 STEP 4: PRE-WARM IN BACKGROUND (NON-BLOCKING)
+        logger.info("🔥 PRE-WARMING API - Starting background warmup...")
+        
+        async def warm_up():
+            import httpx
+            await asyncio.sleep(3)  # Wait for server to settle
+            
+            port = int(os.environ.get("PORT", 8001))
+            base_url = f"http://127.0.0.1:{port}"
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                endpoints = ["/signal", "/price", "/signal/1h", "/signal-strength", "/levels", "/live-stats"]
+                for endpoint in endpoints:
+                    try:
+                        await client.get(f"{base_url}{endpoint}")
+                        logger.info(f"✅ Pre-warmed: {endpoint}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not pre-warm {endpoint}: {e}")
+        
+        # Run warm-up in background (doesn't block startup)
+        asyncio.create_task(warm_up())
+        
+        logger.info("✅ API STARTED - Pre-warming in background")
         
     except Exception as e:
         logger.error(f"❌ Failed to load predictor: {e}")
@@ -1493,32 +1519,75 @@ async def test_webhook(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Webhook failed: {str(e)}")
 
-# KEEP ALIVE SYSTEM
-def keep_alive():
-    render_url = os.environ.get('RENDER_URL', 'https://yasen-alpha-ml-trading-system.onrender.com')
+"""@app.get("/debug/latency", tags=["Debug"])
+async def debug_latency():
+    '''Measure where the time goes for maintenance and debugging latency issues'''
+    import time
     
-    while True:
-        sleep_time = 240 + (60 * random.random())
-        time.sleep(sleep_time)
-        
-        try:
-            response = requests.get(f"{render_url}/health", timeout=10)
-            
-            if response.status_code == 200:
-                if random.random() > 0.5:
-                    requests.get(f"{render_url}/cache-stats", timeout=5)
-                else:
-                    requests.get(f"{render_url}/live-stats", timeout=5)
-                    
-                logger.info(f"💤 Keep-alive ping successful (sleep: {sleep_time:.0f}s)")
-            
-        except Exception as e:
-            logger.error(f"Self-ping failed: {e}")
-            pass
-
-keep_alive_thread = threading.Thread(target=keep_alive, daemon=True)
-keep_alive_thread.start()
-logger.info("✅ Keep-alive system started - API will stay awake 24/7!")
+    results = {}
+    
+    # Test 1: Cache read
+    start = time.time()
+    cache.get('signal')
+    results['cache_read'] = round((time.time() - start) * 1000, 2)
+    
+    # Test 2: Predictor access
+    start = time.time()
+    predictor = get_predictor()
+    results['predictor_get'] = round((time.time() - start) * 1000, 2)
+    
+    # Test 3: Data loading
+    start = time.time()
+    df = pd.read_parquet('data/processed/features_latest.parquet')
+    results['data_load'] = round((time.time() - start) * 1000, 2)
+    
+    # Test 4: Feature columns
+    start = time.time()
+    exclude_cols = ['open', 'high', 'low', 'close', 'volume']
+    feature_cols = [col for col in df.columns if col not in exclude_cols]
+    results['feature_cols'] = round((time.time() - start) * 1000, 2)
+    
+    # Test 5: Resampling (if you call it)
+    start = time.time()
+    df_resampled = resample_data('1h')
+    results['resample'] = round((time.time() - start) * 1000, 2)
+    
+    # Test 6: Model prediction
+    start = time.time()
+    try:
+        signal = predictor.get_current_signal()
+        results['prediction'] = round((time.time() - start) * 1000, 2)
+    except Exception as e:
+        results['prediction'] = f"Error: {e}"
+    
+    # Test 7: Full signal endpoint simulation
+    start = time.time()
+    try:
+        # Simulate the signal endpoint
+        cached_signal = cache.get('signal')
+        if cached_signal:
+            signal_response = cached_signal
+        else:
+            signal_data = predictor.get_current_signal()
+            signal_response = {
+                'signal': signal_data['signal'],
+                'confidence': signal_data['confidence']
+            }
+        results['full_signal'] = round((time.time() - start) * 1000, 2)
+    except Exception as e:
+        results['full_signal'] = f"Error: {e}"
+    
+    # Calculate total
+    total = sum([v for v in results.values() if isinstance(v, (int, float))])
+    
+    return JSONResponse(
+        content={
+            "latency_breakdown_ms": results,
+            "total_estimated_ms": total,
+            "note": "First request is slower; subsequent are cached"
+        },
+        headers={"X-Debug": "true"}
+    )"""
 
 if __name__ == "__main__":
     import uvicorn
